@@ -2,3 +2,7 @@ wdbo_criterion
 gpytorch
 torch
 botorch
+matplotlib>=3.8
+
+[dev]
+pytest>=8

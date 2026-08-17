@@ -7,3 +7,7 @@ NOTE.md
 data
 # Package build and metadata files
 *.egg-info/
+.venv-wsl/
+.venv/
+criterion_source/
+criterion_wheels/

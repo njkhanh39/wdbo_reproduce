@@ -18,8 +18,20 @@ dependencies = [
   "wdbo_criterion",
     "gpytorch",
     "torch",
-    "botorch"
+    "botorch",
+    "matplotlib>=3.8"
 ]
 
 [project.urls]
 Project = "https://github.com/WDBO-ALGORITHM"
+
+[project.scripts]
+wdbo-synthetic = "wdbo_algo.run_benchmark:main"
+wdbo-plot = "wdbo_algo.plot_results:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

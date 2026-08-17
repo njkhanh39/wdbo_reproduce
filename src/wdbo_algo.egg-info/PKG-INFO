@@ -12,6 +12,9 @@ Requires-Dist: wdbo_criterion
 Requires-Dist: gpytorch
 Requires-Dist: torch
 Requires-Dist: botorch
+Requires-Dist: matplotlib>=3.8
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
 Dynamic: license-file
 
 # A Wasserstein Distance-Based Dynamic Bayesian Optimization Algorithm (W-DBO)
@@ -31,6 +34,7 @@ W-DBO is authored by [Anthony Bardou](https://abardou.github.io/), [Patrick Thir
 - [Citing this Work](#citing-this-work)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Synthetic benchmarks from the paper](#synthetic-benchmarks-from-the-paper)
 - [Troubleshooting](#troubleshooting)
 - [References](#references)
 
@@ -148,6 +152,57 @@ if __name__ == "__main__":
 
 		current_time += (end - start) / 60.0
 ```
+
+## Synthetic benchmarks from the paper
+
+The ten synthetic benchmarks from Appendix H.2 are available as differentiable,
+batched PyTorch functions in `wdbo_algo.benchmarks`. Their spatial inputs and
+time are normalized to `[0, 1]` before being mapped to the native domain stated
+in the paper.
+
+```python
+import torch
+from wdbo_algo.benchmarks import BENCHMARKS
+
+benchmark = BENCHMARKS["ackley"]
+x = torch.rand(128, benchmark.spatial_dimension, dtype=torch.double)
+t = torch.full((128,), 0.4, dtype=torch.double)
+
+loss = benchmark.evaluate(x, t)       # Appendix H.2 formula (minimize)
+objective = benchmark.objective(x, t) # negated value for WDBO/GP-UCB (maximize)
+```
+
+All operations preserve PyTorch dtype, device, batching, and autograd. The
+registry contains Rastrigin-5D, Schwefel-4D, Styblinski-Tang-4D, Eggholder-2D,
+Ackley-4D, Rosenbrock-3D, Shekel-4D, Hartmann-3D, Hartmann-6D, and Powell-4D,
+where the final dimension is time.
+
+After installing the package, run the paper's 600-second W-DBO setting with:
+
+```powershell
+wdbo-synthetic ackley --duration-seconds 600 --seed 0
+```
+
+This uses the Appendix H.1 settings: 15 initial observations sampled from
+`[0,1]^d x [0,1/40]`, Matérn-5/2 spatial and Matérn-3/2 temporal kernels,
+`alpha=0.25`, and Gaussian noise whose variance is 5% of signal variance. For a
+quick installation check before a full run, add `--max-iterations 1`.
+
+### Paper-style plots
+
+After completing several seeds, draw the two panels used in Appendix H.2:
+
+```bash
+wdbo-plot results/ackley_seed*.csv \
+  --benchmark ackley \
+  --output plots/ackley_paper.png
+```
+
+The left panel shows each replication and the mean standard-error bars for
+average response time versus average regret. The right panel shows mean dataset
+size through the experiment, with standard-error shading. Both axes use the log
+scales and W-DBO styling used in the paper. The command also accepts `.pdf` as
+the output suffix for a vector figure suitable for a thesis or presentation.
 
 ## Troubleshooting
 
