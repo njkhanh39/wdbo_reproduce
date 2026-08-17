@@ -1,6 +1,7 @@
 LICENCE
 README.md
 pyproject.toml
+src/test.py
 src/wdbo_algo/__init__.py
 src/wdbo_algo/model.py
 src/wdbo_algo/optimizer.py

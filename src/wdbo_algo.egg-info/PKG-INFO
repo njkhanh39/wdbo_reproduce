@@ -1,4 +1,4 @@
-Metadata-Version: 2.1
+Metadata-Version: 2.4
 Name: wdbo_algo
 Version: 1.0.7
 Summary: W-DBO Algotithm for Dynamic Bayesian Optimization
@@ -12,6 +12,7 @@ Requires-Dist: wdbo_criterion
 Requires-Dist: gpytorch
 Requires-Dist: torch
 Requires-Dist: botorch
+Dynamic: license-file
 
 # A Wasserstein Distance-Based Dynamic Bayesian Optimization Algorithm (W-DBO)
 

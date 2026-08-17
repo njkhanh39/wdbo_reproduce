@@ -111,6 +111,7 @@ def learn_model_space_time(xx_tt, space_kernel, space_kernel_args, time_kernel, 
 	"""
 	likelihood = gpytorch.likelihoods.GaussianLikelihood()
 	gpr = SpaceTimeGPModel(space_kernel, space_kernel_args, time_kernel, time_kernel_args, torch.tensor(xx_tt), torch.tensor(yy_normalized), likelihood)
+	gpr = gpr.double()
 	gpr.fit()
 
 	return gpr

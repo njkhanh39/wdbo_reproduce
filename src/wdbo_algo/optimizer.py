@@ -156,9 +156,9 @@ class WDBOOptimizer:
 		
 		# The initial observations are gathered, we now have to optimize the acquisition function
 		UCB = UpperConfidenceBound(self._gpr, beta=0.2 * self._d * np.log(2 * self._xx_tt.shape[0]))
-		low_bounds = torch.zeros(self._d+1)
+		low_bounds = torch.zeros(self._d+1, dtype=torch.float64)
 		low_bounds[-1] = current_time
-		up_bounds = torch.ones(self._d+1)
+		up_bounds = torch.ones(self._d+1, dtype=torch.float64)
 		up_bounds[-1] = current_time
 		bounds = torch.stack([low_bounds, up_bounds])
 		candidate, _ = optimize_acqf(UCB, bounds=bounds, q=1, num_restarts=20, raw_samples=512,)

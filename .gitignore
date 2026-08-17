@@ -1,2 +1,9 @@
 **/*.idea
 .vscode/*
+# Compiled Python files
+__pycache__/
+*.pyc
+NOTE.md
+data
+# Package build and metadata files
+*.egg-info/
