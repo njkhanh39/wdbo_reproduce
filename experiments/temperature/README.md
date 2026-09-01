@@ -148,19 +148,12 @@ before averaging); the default is 1 for a quick single run. The paper's own
 figures use 10 replications, so `--n-seeds 10` is what an actual "official"
 reproduction run should use — it just takes ~10x longer.
 
-Results are written to:
-
-- `data/temperature/results/regret.csv` — per-iteration (or, with
-  `--n-seeds > 1`, averaged) log of duration, regret and dataset size.
-- `data/temperature/results/regret_and_size_vs_duration.png` — regret and
-  dataset size vs. elapsed duration (seconds, dataset size on a log axis),
-  reproducing Figure 20 (right).
-- `data/temperature/results/regret_vs_response_time.png` — every individual
-  query's regret vs. its response time (log axis), with the mean marked,
-  reproducing Figure 20 (left). The paper's version overlays one such
-  box/scatter per baseline algorithm (GP-UCB, ABO, ...); since this script
-  only runs W-DBO, ours shows W-DBO's own query cloud and mean instead of a
-  multi-algorithm comparison.
+Results are written to `data/temperature/results/`: 2 CSVs (`regret.csv`,
+`summary.csv`) and 2 plot files holding 3 panels total (regret + dataset
+size vs. duration, and regret vs. response time) — reproducing both halves
+of Figure 20. **See [help.md](help.md) for exactly what each file/metric
+means** (in particular, instantaneous vs. average/running regret — easy to
+mix up).
 
 ## 4. What this reproduction does and doesn't match exactly
 

@@ -89,6 +89,61 @@ def average_over_seeds(runs: list[list[dict]], duration_seconds: float, n_points
     ]
 
 
+def running_average(values: np.ndarray) -> np.ndarray:
+    """Cumulative mean: element i is the average of values[0..i]."""
+    return np.cumsum(values) / np.arange(1, len(values) + 1)
+
+
+def compute_duration_stats(runs: list[list[dict]], duration_seconds: float, n_points: int) -> dict:
+    """Interpolate the running (cumulative) average regret and the dataset
+    size of every replication onto a common wall-clock grid, and return their
+    per-grid-point mean and standard deviation across replications.
+
+    "Average regret up to t" here follows the convention R_t / t = the mean
+    of every query's instantaneous regret among queries made up to time t
+    (a cumulative mean over queries, not a division by wall-clock t).
+    """
+    grid = np.linspace(0.0, duration_seconds, n_points)
+
+    running_regret = np.stack([
+        np.interp(grid, [row["wall_time"] for row in run], running_average(np.array([row["regret"] for row in run])))
+        for run in runs
+    ])
+    dataset_size = np.stack([
+        np.interp(grid, [row["wall_time"] for row in run], [row["dataset_size"] for row in run])
+        for run in runs
+    ])
+
+    return {
+        "wall_time": grid,
+        "regret_mean": running_regret.mean(axis=0),
+        "regret_std": running_regret.std(axis=0),
+        "dataset_size_mean": dataset_size.mean(axis=0),
+        "dataset_size_std": dataset_size.std(axis=0),
+    }
+
+
+def summarize_runs(runs: list[list[dict]]) -> dict:
+    """Per-replication summary statistics.
+
+    Each replication contributes one number (its own average regret over the
+    whole run, and its own average response time); we report the mean and
+    variance of those numbers across replications, matching the paper's
+    "independent replications" convention used throughout Appendix H.
+    """
+    final_avg_regret = np.array([np.mean([row["regret"] for row in run]) for run in runs])
+    avg_response_time = np.array([np.mean([row["response_time"] for row in run]) for run in runs])
+    ddof = 1 if len(runs) > 1 else 0
+
+    return {
+        "n_runs": len(runs),
+        "avg_regret_mean": float(final_avg_regret.mean()),
+        "avg_regret_var": float(final_avg_regret.var(ddof=ddof)),
+        "avg_response_time_mean": float(avg_response_time.mean()),
+        "avg_response_time_var": float(avg_response_time.var(ddof=ddof)),
+    }
+
+
 def save_csv(rows: list[dict], path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="") as f:
@@ -97,19 +152,36 @@ def save_csv(rows: list[dict], path: Path):
         writer.writerows(rows)
 
 
-def save_duration_plot(rows: list[dict], path: Path):
-    """Regret and dataset size over elapsed real duration, mirroring Figure 20 (right)."""
+def save_summary_csv(summary: dict, duration_seconds: float, path: Path):
+    """A second, small summary file: one headline number (mean + variance
+    across replications) each for regret and response time."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["metric", "mean", "variance", "n_runs"])
+        writer.writerow([f"average_regret_up_to_t={duration_seconds:g}s", summary["avg_regret_mean"], summary["avg_regret_var"], summary["n_runs"]])
+        writer.writerow(["average_response_time_s", summary["avg_response_time_mean"], summary["avg_response_time_var"], summary["n_runs"]])
+
+
+def save_duration_plot(stats: dict, path: Path):
+    """Average regret and dataset size over elapsed real duration, with a
+    shaded +/- 1 std. dev. band across replications, mirroring Figure 20 (right).
+    """
     import matplotlib.pyplot as plt
 
-    wall_time = [row["wall_time"] for row in rows]
+    wall_time = stats["wall_time"]
     fig, (regret_ax, size_ax) = plt.subplots(1, 2, figsize=(10, 4))
 
-    regret_ax.plot(wall_time, [row["regret"] for row in rows])
+    regret_mean, regret_std = stats["regret_mean"], stats["regret_std"]
+    regret_ax.plot(wall_time, regret_mean)
+    regret_ax.fill_between(wall_time, regret_mean - regret_std, regret_mean + regret_std, alpha=0.25)
     regret_ax.set_xlabel("Duration (s)")
-    regret_ax.set_ylabel("Simple regret")
+    regret_ax.set_ylabel("Average regret up to t")
     regret_ax.set_title("Regret")
 
-    size_ax.plot(wall_time, [row["dataset_size"] for row in rows])
+    size_mean, size_std = stats["dataset_size_mean"], stats["dataset_size_std"]
+    size_ax.plot(wall_time, size_mean)
+    size_ax.fill_between(wall_time, np.clip(size_mean - size_std, 1e-6, None), size_mean + size_std, alpha=0.25)
     size_ax.set_yscale("log")
     size_ax.set_xlabel("Duration (s)")
     size_ax.set_ylabel("Dataset size")
@@ -120,14 +192,14 @@ def save_duration_plot(rows: list[dict], path: Path):
     fig.savefig(path, dpi=150)
 
 
-def save_regret_vs_response_time_plot(runs: list[list[dict]], path: Path):
+def save_regret_vs_response_time_plot(runs: list[list[dict]], summary: dict, path: Path):
     """Per-query regret vs. response time, mirroring Figure 20 (left).
 
     The paper's version compares several algorithms (one box per algorithm);
     since this script only runs W-DBO, we instead scatter every individual
-    query across all replications and mark the mean, which is the
-    single-algorithm equivalent of the same average-regret-vs-average-response-time
-    trade-off.
+    query across all replications and mark the mean +/- 1 std. dev. across
+    replications, which is the single-algorithm equivalent of the same
+    average-regret-vs-average-response-time trade-off.
     """
     import matplotlib.pyplot as plt
 
@@ -136,7 +208,11 @@ def save_regret_vs_response_time_plot(runs: list[list[dict]], path: Path):
 
     fig, ax = plt.subplots(figsize=(5, 4))
     ax.scatter(response_times, regrets, s=10, alpha=0.3, label="Individual queries")
-    ax.scatter(response_times.mean(), regrets.mean(), s=120, marker="X", color="black", label="Mean", zorder=3)
+    ax.errorbar(
+        summary["avg_response_time_mean"], summary["avg_regret_mean"],
+        xerr=summary["avg_response_time_var"] ** 0.5, yerr=summary["avg_regret_var"] ** 0.5,
+        fmt="X", color="black", markersize=10, capsize=4, label="Mean +/- 1 std (across runs)", zorder=3,
+    )
     ax.set_xscale("log")
     ax.set_xlabel("Response Time (s)")
     ax.set_ylabel("Regret")
@@ -156,9 +232,10 @@ def main():
     parser.add_argument("--duration-seconds", type=float, default=600.0, help="Real wall-clock budget per replication (paper default: 600s).")
     parser.add_argument("--n-initial-observations", type=int, default=15)
     parser.add_argument("--alpha", type=float, default=0.25)
-    parser.add_argument("--n-seeds", type=int, default=1, help="Number of independent replications to average (paper uses 10).")
+    parser.add_argument("--n-seeds", type=int, default=10, help="Number of independent replications to average (paper uses 10).")
     parser.add_argument("--seed", type=int, default=0, help="Base seed; replication i uses seed + i.")
     parser.add_argument("--output-csv", type=Path, default=DATA_DIR / "results" / "regret.csv")
+    parser.add_argument("--output-summary-csv", type=Path, default=DATA_DIR / "results" / "summary.csv")
     parser.add_argument("--output-duration-plot", type=Path, default=DATA_DIR / "results" / "regret_and_size_vs_duration.png")
     parser.add_argument("--output-response-time-plot", type=Path, default=DATA_DIR / "results" / "regret_vs_response_time.png")
     args = parser.parse_args()
@@ -172,12 +249,17 @@ def main():
         runs.append(run_once(objective, args.duration_seconds, args.n_initial_observations, args.alpha, args.seed + i, progress_prefix=prefix))
 
     rows = average_over_seeds(runs, args.duration_seconds, n_points=200) if args.n_seeds > 1 else runs[0]
+    duration_stats = compute_duration_stats(runs, args.duration_seconds, n_points=200)
+    summary = summarize_runs(runs)
 
     save_csv(rows, args.output_csv)
-    save_duration_plot(rows, args.output_duration_plot)
-    save_regret_vs_response_time_plot(runs, args.output_response_time_plot)
-    print(f"Final regret: {rows[-1]['regret']:.4f} | final dataset size: {rows[-1]['dataset_size']:.1f}")
-    print(f"Saved log to {args.output_csv}")
+    save_summary_csv(summary, args.duration_seconds, args.output_summary_csv)
+    save_duration_plot(duration_stats, args.output_duration_plot)
+    save_regret_vs_response_time_plot(runs, summary, args.output_response_time_plot)
+
+    print(f"Average regret up to t={args.duration_seconds:g}s: {summary['avg_regret_mean']:.4f} (var={summary['avg_regret_var']:.4f}) across {summary['n_runs']} run(s)")
+    print(f"Average response time: {summary['avg_response_time_mean']:.4f}s (var={summary['avg_response_time_var']:.4f}) across {summary['n_runs']} run(s)")
+    print(f"Saved logs to {args.output_csv} and {args.output_summary_csv}")
     print(f"Saved plots to {args.output_duration_plot} and {args.output_response_time_plot}")
 
 
