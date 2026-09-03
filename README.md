@@ -176,14 +176,14 @@ After completing several seeds, draw the two panels used in Appendix H.2:
 ```bash
 wdbo-plot results/ackley_seed*.csv \
   --benchmark ackley \
-  --output plots/ackley_paper.png
+  --output-dir plots/ackley
 ```
 
-The left panel shows each replication and the mean standard-error bars for
-average response time versus average regret. The right panel shows mean dataset
-size through the experiment, with standard-error shading. Both axes use the log
-scales and W-DBO styling used in the paper. The command also accepts `.pdf` as
-the output suffix for a vector figure suitable for a thesis or presentation.
+The command writes `regret.csv`, `summary.csv`,
+`regret_and_size_vs_duration.png`, and `regret_vs_response_time.png`. The first
+image contains running average regret and dataset size versus duration, with
+one-standard-deviation bands across seeds. The second contains the individual
+query scatter and the replication-level mean and standard deviation marker.
 
 ## Troubleshooting
 

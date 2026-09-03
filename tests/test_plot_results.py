@@ -2,7 +2,7 @@ import csv
 
 import pytest
 
-from wdbo_algo.plot_results import load_run, plot_runs
+from wdbo_algo.plot_results import load_run, plot_runs, write_paper_outputs
 
 
 FIELDS = [
@@ -75,4 +75,25 @@ def test_plot_runs_creates_paper_style_figure(tmp_path):
 	created, summary = plot_runs([first, second], output=output, grid_points=21)
 	assert created == output.resolve()
 	assert output.stat().st_size > 10_000
+	assert summary["W-DBO"]["runs"] == 2
+
+
+def test_write_paper_outputs_creates_two_csvs_and_two_plots(tmp_path):
+	first = tmp_path / "ackley_wdbo_seed0.csv"
+	second = tmp_path / "ackley_wdbo_seed1.csv"
+	_write_run(first, seed=0)
+	_write_run(second, seed=1, response_offset=0.25)
+	output_dir = tmp_path / "paper"
+	outputs, summary = write_paper_outputs(
+		[first, second], output_dir=output_dir, grid_points=21
+	)
+	assert [path.name for path in outputs] == [
+		"regret.csv",
+		"summary.csv",
+		"regret_and_size_vs_duration.png",
+		"regret_vs_response_time.png",
+	]
+	assert all(path.exists() for path in outputs)
+	assert outputs[2].stat().st_size > 10_000
+	assert outputs[3].stat().st_size > 10_000
 	assert summary["W-DBO"]["runs"] == 2
