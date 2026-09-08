@@ -234,6 +234,7 @@ def main():
     parser.add_argument("--alpha", type=float, default=0.25)
     parser.add_argument("--n-seeds", type=int, default=10, help="Number of independent replications to average (paper uses 10).")
     parser.add_argument("--seed", type=int, default=0, help="Base seed; replication i uses seed + i.")
+    parser.add_argument("--same-seed", action="store_true", help="Use the same --seed for every replication instead of seed + i.")
     parser.add_argument("--output-csv", type=Path, default=DATA_DIR / "results" / "regret.csv")
     parser.add_argument("--output-summary-csv", type=Path, default=DATA_DIR / "results" / "summary.csv")
     parser.add_argument("--output-duration-plot", type=Path, default=DATA_DIR / "results" / "regret_and_size_vs_duration.png")
@@ -246,7 +247,8 @@ def main():
     runs = []
     for i in range(args.n_seeds):
         prefix = f"seed {i + 1}/{args.n_seeds} " if args.n_seeds > 1 else ""
-        runs.append(run_once(objective, args.duration_seconds, args.n_initial_observations, args.alpha, args.seed + i, progress_prefix=prefix))
+        seed = args.seed if args.same_seed else args.seed + i
+        runs.append(run_once(objective, args.duration_seconds, args.n_initial_observations, args.alpha, seed, progress_prefix=prefix))
 
     rows = average_over_seeds(runs, args.duration_seconds, n_points=200) if args.n_seeds > 1 else runs[0]
     duration_stats = compute_duration_stats(runs, args.duration_seconds, n_points=200)
