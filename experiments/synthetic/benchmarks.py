@@ -4,19 +4,22 @@ Every synthetic benchmark in the paper is a standard global-optimization test
 function whose LAST input axis is reinterpreted as time: the paper writes each
 one as ``f(z)`` with ``z = (x_1, ..., x_d, t)`` and ``d' = d + 1``.
 
-Two scale conventions, both from Appendix H.1:
+Scale conventions. Appendix H.2 gives each benchmark a single box covering
+**all** ``d'`` axes - for Ackley, "we optimized the function on the domain
+``[-32, 32]^d'``" with ``d' = 4`` and ``z = (x_1, ..., x_d, t)``. So the
+function's time argument spans the same box as its spatial ones, and that is
+what ``temporal_span`` records here. Appendix H.1's "the temporal domain is
+normalized in ``[0, 1]``" describes what the *optimizer* sees, not the
+function: `WDBOOptimizer` normalizes space itself and expects a clock in
+``[0, 1]``, so `objective.py` maps that clock onto ``temporal_span``.
 
-* the ``d`` spatial axes use the function's natural box (e.g. Ackley on
-  ``[-32, 32]^d``);
-* the temporal axis is **normalized to ``[0, 1]``** - it is *not* rescaled to
-  the spatial box. (Rescaling it, as an over-literal reading of "optimized on
-  the domain ``[lo, hi]^d'``" would suggest, makes oscillatory benchmarks
-  like Ackley flip sign many times across the horizon, destroying the
-  temporal correlation W-DBO exists to exploit - and contradicts the
-  moderate dataset sizes W-DBO shows in the paper's figures.)
+(Reading H.1 as a statement about the function instead - time literally in
+``[0, 1]`` while space spans ``[-32, 32]`` - makes Ackley far smoother in
+time than in space. Pass ``--time-span 0 1`` to run that variant; it is a
+sensitivity check, not the paper's setting.)
 
-So a benchmark here is a vectorized function, its ``d`` spatial box, and
-whether it is minimized. `objective.py` turns one into the ``f(x, t)`` /
+So a benchmark here is a vectorized function, its ``d`` spatial box, the
+range its time axis spans, and whether it is minimized. `objective.py` turns one into the ``f(x, t)`` /
 ``oracle(t)`` pair the experiment loop needs; `run_experiment.py` selects one
 with ``--benchmark``.
 """
@@ -38,8 +41,9 @@ class Benchmark:
         name: registry key, also the results sub-directory name.
         spatial_domain: ``(d, 2)`` natural box for the spatial axes.
         func: vectorized, maps an ``(n, d + 1)`` array to ``(n,)``. The last
-            column is time in ``[0, 1]`` (already on the same footing as the
-            other columns numerically - no internal rescale).
+            column is time, already scaled to ``temporal_span`` by the caller.
+        temporal_span: the range the function's time axis covers (Appendix
+            H.2's box, applied to the ``(d + 1)``th axis).
         minimize: ``True`` if the task is to find the function's minimum. The
             paper's synthetic functions are all minimized while the DBO loop
             maximizes, so `objective.py` negates the objective accordingly.
@@ -48,6 +52,7 @@ class Benchmark:
     name: str
     spatial_domain: np.ndarray
     func: FuncT
+    temporal_span: tuple[float, float] = (0.0, 1.0)
     minimize: bool = True
 
     @property
@@ -61,8 +66,8 @@ class Benchmark:
 
     @property
     def domain(self) -> np.ndarray:
-        """``(d', 2)``: the spatial box rows plus the temporal ``[0, 1]`` row."""
-        return np.vstack([self.spatial_domain, [[0.0, 1.0]]])
+        """``(d', 2)``: the spatial box rows plus the temporal row."""
+        return np.vstack([self.spatial_domain, [list(self.temporal_span)]])
 
 
 def ackley(z: np.ndarray, a: float = 20.0, b: float = 0.2, c: float = 2.0 * np.pi) -> np.ndarray:
@@ -72,10 +77,9 @@ def ackley(z: np.ndarray, a: float = 20.0, b: float = 0.2, c: float = 2.0 * np.p
     with local minima surrounding one deep central well. The paper highlights
     Ackley because most DBO baselines never find that well.
 
-    With time normalized to ``[0, 1]`` while space spans ``[-32, 32]``, the
-    spatial argmin stays at the origin for every ``t`` (both terms are
-    minimized there regardless of the fixed time coordinate); the time axis
-    enters only as a smooth, single-period ripple in the achievable value.
+    The spatial argmin stays at the origin for every ``t`` - both terms are
+    minimized there whatever the fixed time coordinate - so the time axis
+    only modulates the best achievable value, not where it is found.
     """
     z = np.atleast_2d(np.asarray(z, dtype=float))
     radial = np.sqrt(np.mean(z ** 2, axis=1))
@@ -87,6 +91,7 @@ ACKLEY4D = Benchmark(
     name="ackley4d",
     spatial_domain=np.array([[-32.0, 32.0]] * 3),
     func=ackley,
+    temporal_span=(-32.0, 32.0),  # Appendix H.2: the [-32, 32] box covers all d' = 4 axes
     minimize=True,
 )
 

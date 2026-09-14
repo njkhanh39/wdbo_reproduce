@@ -136,9 +136,17 @@ query) and its oracle curve (a dense space-time grid search, cached to
 `WDBOOptimizer` exactly as described in the paper's Appendix H.1:
 
 - Matérn-5/2 spatial kernel, Matérn-3/2 temporal kernel.
-- 15 initial random observations, `alpha = 0.25` (the paper's sensitivity
-  analysis, §5.1, settles on `alpha = 1/3` for its headline Table 2 run;
-  pass `--alpha 0.3333` to match that exactly).
+- `alpha = 0.25`. §5.1's sensitivity analysis concludes: "the sweet spot is
+  reached for α = ¼. This hyperparameter value is used to evaluate W-DBO in
+  the next section" — so every Table 2 number is `α = 1/4`.
+- 15 initial observations drawn uniformly from `S' × [0, 1/40]`, per H.1 —
+  spread over the first fortieth of the horizon rather than stacked at
+  `t = 0`. This matters: 15 observations at a single instant carry no
+  information about the temporal lengthscale `lT`, which the removal budget
+  `(1 + alpha) ** (dt / lT)` divides by. That window is charged against the
+  600 s budget, so the optimization loop starts at `t = 1/40`. Initial
+  observations are not queries the algorithm chose, so they do not appear in
+  the regret log.
 - Each replication runs for a fixed real wall-clock budget (default 600s /
   10 minutes, matching the paper), during which the optimizer's internal
   clock sweeps linearly over the day (`current_time = elapsed / duration`).
@@ -317,15 +325,15 @@ step 1, so the band is broad and roughly uniform throughout, and
 ## 7. What this reproduction does and doesn't match exactly
 
 - **Matches**: the benchmark's definition (3D spatio-temporal, first day of
-  data, activate-the-hottest-point task), the kernel choices, initial
-  observation count, wall-clock experiment budget, and noise model — all
-  taken directly from Appendix H.1/H.2 of the paper.
+  data, activate-the-hottest-point task), the kernel choices, the 15 initial
+  observations over `S' × [0, 1/40]`, `alpha = 1/4`, the 600 s wall-clock
+  budget, and the noise model — all taken directly from Appendix H.1/H.2 of
+  the paper.
 - **Approximates**: the exact 46-sensor subset (we use a documented,
-  reproducible 48-sensor filter instead — see §2); the exact interpolation
-  method used to build the ground-truth surface (the paper doesn't specify
-  one; we use a thin-plate-spline RBF interpolator, a standard,
-  deterministic choice for scattered spatio-temporal data); and `alpha`
-  (script default `0.25` vs. the paper's `1/3` headline value — see §3).
+  reproducible 48-sensor filter instead — see §2); and the exact
+  interpolation method used to build the ground-truth surface (the paper
+  doesn't specify one; we use a thin-plate-spline RBF interpolator, a
+  standard, deterministic choice for scattered spatio-temporal data).
 - **Not included**: comparisons against the other baselines from the paper
   (GP-UCB, TV-GP-UCB, ABO, ET-GP-UCB, ...) — this reproduces W-DBO's own
   behavior on the benchmark, not the full comparative study.

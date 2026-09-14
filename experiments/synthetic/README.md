@@ -26,27 +26,32 @@ The paper writes every synthetic benchmark as `f(z)` with
 axis is just the last input of an ordinary optimization test function**, and
 the spatial optimum drifts as the clock advances.
 
-Two scale conventions matter, both from H.1:
+Two scale conventions matter:
 
 - **The `d` spatial axes use the function's natural box** (Ackley:
   `[−32, 32]^d`). `ackley4d` is `d' = 4`, so the optimizer works in a **3-D**
   spatial box `[−32, 32]^3` with time as the 4th axis. (`temperature` is
   fixed at `d' = 3`, `[0, 1]^2` spatial.)
-- **The temporal axis is normalized to `[0, 1]` — not rescaled to the
-  spatial box.** H.1 says "the temporal domain [...] is normalized in
-  `[0, 1]`", and the paper's Table 5 temporal lengthscales (`l_T ≈ 0.6`
-  "axis unit") only make sense on a `[0, 1]` axis. Rescaling time into
-  `[−32, 32]` (an over-literal reading of "optimized on `[lo, hi]^d'`")
-  would make Ackley's `cos(2πt)` term flip sign 64× across the run, leaving
-  successive-in-time observations uncorrelated — W-DBO would then correctly
-  purge its whole dataset every step, contradicting the moderate dataset
-  sizes it shows in Figure 13. `src/test.py`'s toy demo *does* rescale its
-  clock into the Rosenbrock box (`5t/8 − 1`); the real benchmarks do not.
+- **The temporal axis spans the same box as the spatial ones.** H.2 gives
+  one domain per benchmark covering all `d'` axes — "we optimized the
+  function on the domain `[−32, 32]^d'`" with `d' = 4` and
+  `z = (x_1, …, x_d, t)` — so Ackley's time argument runs over `[−32, 32]`,
+  like its three spatial arguments. H.1's "the temporal domain [...] is
+  normalized in `[0, 1]`" is a statement about what the **optimizer** sees:
+  `WDBOOptimizer` normalizes space itself and takes a clock in `[0, 1]`
+  (it even passes `0, 1` as the criterion's time-integration bounds), and
+  `objective.py` maps that clock onto the benchmark's `temporal_span`.
 
-  For Ackley specifically the spatial argmin stays at the origin for every
-  `t` regardless (both terms are minimized there), so the "dynamic" part is
-  a smooth single-period ripple in the *achievable value*, not a moving
-  optimum — the same is true under either scale convention; §5.2 of the
+  Each benchmark carries its own `temporal_span` in `benchmarks.py`;
+  `--time-span 0 1` runs the other reading (time literally in `[0, 1]`
+  while space spans `[−32, 32]`, which makes Ackley far smoother in time
+  than in space) as a sensitivity check. Saved results under
+  `results_t-32_32/` use the paper's setting, `results/` and
+  `results_t-4_4/` are variants.
+
+  For Ackley the spatial argmin stays at the origin for every `t` under
+  either convention (both terms are minimized there), so the "dynamic" part
+  is a ripple in the *achievable value*, not a moving optimum; §5.2 of the
   paper frames Ackley's difficulty as an exploration/acquisition problem,
   not an optimum-tracking one.
 
@@ -63,7 +68,7 @@ No preprocessing and no data download — the objective is analytic.
 
 ```
 benchmarks.py    →  Benchmark: a vectorized f(z), its d spatial box,
-       │              minimize flag  (time axis is always [0, 1])
+       │              its temporal span, minimize flag
        ▼
 objective.py     →  f(x, t)  (append clock as last axis + sign flip)
        │              + oracle(t) = max_x (−f(x, t)) via a dense spatial
@@ -79,7 +84,8 @@ run_experiment.py → runs WDBOOptimizer against the objective,
 
 `oracle(t)` is built once by `compute_oracle_curve`: a regular
 `grid_resolution ** spatial_dim` spatial grid, evaluated at
-`oracle_time_points` times in `[0, 1]`, taking the max of `−f` at each time;
+`oracle_time_points` clock values in `[0, 1]` (each mapped onto the
+benchmark's `temporal_span`), taking the max of `−f` at each time;
 the curve is cached and read with `np.interp` in the hot loop. Notes:
 
 - **`--oracle-grid-resolution` (default 33, odd).** Odd so a symmetric-domain
@@ -88,10 +94,13 @@ the curve is cached and read with `np.interp` in the hot loop. Notes:
   regret for origin queries, no negative regrets over 50k random probes).
   The grid has `33^3 ≈ 3.6·10^4` nodes for `ackley4d`; this is only
   practical while `spatial_dim ≲ 3`.
-- **`--oracle-time-points` (default 1000).** With time in `[0, 1]`, Ackley's
-  `oracle(t)` is a smooth single-period ripple (range ≈ `[−2.16, 0]`), so
-  `np.interp` on 1000 samples is far more than enough. First run spends
-  ~3 s here, then it is cached.
+- **`--oracle-time-points` (default 4000).** Ackley's `cos(2πz)` term
+  completes one period per unit of time, so over `[−32, 32]` `oracle(t)`
+  oscillates 64× across the horizon (range ≈ `[−20.2, −0.02]`) and needs a
+  few thousand samples before `np.interp` tracks it — 1000 would alias
+  badly. Under `--time-span 0 1` it is a single smooth ripple (range ≈
+  `[−2.16, 0]`) and 1000 is ample. First run spends a few seconds here,
+  then it is cached (per span — see the `_t<lo>_<hi>` filename tag).
 - **Noise.** `estimate_noise_std` sets `σ` so `Var(noise) = 5 % ·` signal
   variance (paper H.1), estimating the signal variance by sampling `f`
   uniformly over the full `d'` box, time included (deterministic; ≈ 0.38 for
@@ -110,15 +119,21 @@ the compiled `wdbo_criterion` extension; see [`../../NOTE.md`](../../NOTE.md).)
 |---|---|---|---|
 | `--benchmark` | `ackley4d` | — | key in `benchmarks.py` |
 | `--duration-seconds` | 600 | 600 (10 min) | real wall-clock budget per replication |
-| `--n-initial-observations` | 15 | 15 | |
-| `--alpha` | `1/3` | `1/3` | removal-budget hyperparameter (§5.1 sensitivity analysis / Table 2). Note `temperature`'s script defaults to 0.25. |
+| `--n-initial-observations` | 15 | 15 | drawn over `S' × [0, 1/40]`, per H.1 |
+| `--time-span` | benchmark's own | H.2 box (Ackley: `−32 32`) | see §1 |
+| `--alpha` | `0.25` | `1/4` | removal-budget hyperparameter. §5.1: "the sweet spot is reached for α = ¼. This hyperparameter value is used to evaluate W-DBO in the next section." |
 | `--n-seeds` | 10 | 10 | independent replications to average |
 | `--seed` / `--same-seed` | 0 / off | — | see [`../temperature/README.md`](../temperature/README.md) §4 |
-| `--oracle-time-points` | 1000 | — | oracle curve resolution (§2) |
+| `--oracle-time-points` | 4000 | — | oracle curve resolution (§2) |
 | `--oracle-grid-resolution` | 33 | — | oracle spatial grid, per axis (§2) |
 
 Kernels and the real-time loop are identical to `temperature`: Matérn-5/2
-spatial, Matérn-3/2 temporal, clock `= elapsed / duration_seconds`.
+spatial, Matérn-3/2 temporal, clock `= elapsed / duration_seconds`. Per H.1
+the 15 initial observations are drawn uniformly from `S' × [0, 1/40]` —
+spread across the first fortieth of the horizon, not stacked at `t = 0` —
+and that window is charged against the budget, so the optimization loop
+starts at `t = 1/40`. Initial observations are not queries the algorithm
+chose, so they are excluded from the regret log.
 
 A full `--n-seeds 10 --duration-seconds 600` run is ~100 min of wall time
 (10 × 10 min); use `--n-seeds 1 --duration-seconds 60` for a smoke test.
@@ -163,9 +178,10 @@ yet implemented here.
 ## 6. What matches / approximates / is out of scope
 
 - **Matches**: the benchmark definitions and constants (H.2), the
-  spatio-temporal lifting (`z = (x, t)` on one shared box), kernels, initial
-  observation count, `alpha = 1/3`, wall-clock budget, 10-replication
-  averaging, and the 5 %-signal-variance noise model (H.1).
+  spatio-temporal lifting (`z = (x, t)` on one shared box), kernels, the 15
+  initial observations over `S' × [0, 1/40]`, `alpha = 1/4`, the 600 s
+  wall-clock budget, 10-replication averaging, and the 5 %-signal-variance
+  noise model (H.1).
 - **Approximates**: `oracle(t)` — a dense grid search (the paper does not
   state how it computes its oracle). For `ackley4d` it is effectively exact
   (the spatial optimum sits on a grid node at every `t`); for a benchmark

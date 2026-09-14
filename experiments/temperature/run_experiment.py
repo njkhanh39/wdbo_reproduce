@@ -22,6 +22,9 @@ from objective import build_objective
 from paths import DATA_DIR
 from wdbo_algo.optimizer import WDBOOptimizer
 
+# Paper H.1: initial observations are drawn from S' x [0, 1/40].
+INITIAL_TIME_FRACTION = 1.0 / 40.0
+
 
 def print_progress(current_time: float, dataset_size: int, response_time: float, prefix: str = "", bar_width: int = 30):
     """Render a one-line, in-place progress bar for the current replication."""
@@ -45,9 +48,19 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         alpha=alpha,
     )
 
+    # Paper H.1: the 15 initial observations are sampled uniformly in S' x [0, 1/40],
+    # i.e. spread over the first fortieth of the horizon -- not all at t = 0. Gathered
+    # at a single instant they carry no information about the temporal lengthscale lT,
+    # which the removal budget (1 + alpha) ** (dt / lT) divides by.
+    for t0 in np.sort(rng.uniform(0.0, INITIAL_TIME_FRACTION, n_initial_observations)):
+        x = optimizer.next_query(t0)
+        optimizer.tell(x, t0, objective.evaluate(x, t0) + rng.normal(0.0, objective.noise_std))
+
     log = []
-    start = time.time()
-    current_time = 0.0
+    # That initial window is charged against the experiment budget: back-date the clock
+    # so the optimization loop starts at t = 1/40 and advances continuously from there.
+    start = time.time() - duration_seconds * INITIAL_TIME_FRACTION
+    current_time = INITIAL_TIME_FRACTION
     while current_time < 1.0:
         step_start = time.time()
         x = optimizer.next_query(current_time)

@@ -26,6 +26,9 @@ from objective import build_objective
 from paths import DATA_DIR
 from wdbo_algo.optimizer import WDBOOptimizer
 
+# Paper H.1: initial observations are drawn from S' x [0, 1/40].
+INITIAL_TIME_FRACTION = 1.0 / 40.0
+
 
 def print_progress(current_time: float, dataset_size: int, response_time: float, prefix: str = "", bar_width: int = 30):
     """Render a one-line, in-place progress bar for the current replication."""
@@ -49,9 +52,19 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         alpha=alpha,
     )
 
+    # Paper H.1: the 15 initial observations are sampled uniformly in S' x [0, 1/40],
+    # i.e. spread over the first fortieth of the horizon -- not all at t = 0. Gathered
+    # at a single instant they carry no information about the temporal lengthscale lT,
+    # which the removal budget (1 + alpha) ** (dt / lT) divides by.
+    for t0 in np.sort(rng.uniform(0.0, INITIAL_TIME_FRACTION, n_initial_observations)):
+        x = optimizer.next_query(t0)
+        optimizer.tell(x, t0, objective.evaluate(x, t0) + rng.normal(0.0, objective.noise_std))
+
     log = []
-    start = time.time()
-    current_time = 0.0
+    # That initial window is charged against the experiment budget: back-date the clock
+    # so the optimization loop starts at t = 1/40 and advances continuously from there.
+    start = time.time() - duration_seconds * INITIAL_TIME_FRACTION
+    current_time = INITIAL_TIME_FRACTION
     while current_time < 1.0:
         step_start = time.time()
         x = optimizer.next_query(current_time)
@@ -237,21 +250,22 @@ def main():
     parser.add_argument("--benchmark", default="ackley4d", help="Synthetic benchmark name (see benchmarks.py).")
     parser.add_argument("--duration-seconds", type=float, default=600.0, help="Real wall-clock budget per replication (paper default: 600s).")
     parser.add_argument("--n-initial-observations", type=int, default=15)
-    parser.add_argument("--time-span", type=float, nargs=2, default=(0.0, 1.0), metavar=("LO", "HI"),
+    parser.add_argument("--time-span", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                         help="Range the normalized clock [0,1] is mapped onto for the function's time axis. "
-                             "Default (0 1) = paper H.1's normalized time; (-32 32) puts time on the spatial box.")
-    parser.add_argument("--alpha", type=float, default=1.0 / 3.0, help="WDBO removal-budget hyperparameter (paper's Table 2 value: 1/3).")
+                             "Defaults to the benchmark's own span from Appendix H.2 (Ackley: -32 32).")
+    parser.add_argument("--alpha", type=float, default=0.25, help="WDBO removal-budget hyperparameter (paper's Table 2 value: 1/4).")
     parser.add_argument("--n-seeds", type=int, default=10, help="Number of independent replications to average (paper uses 10).")
     parser.add_argument("--seed", type=int, default=0, help="Base seed; replication i uses seed + i.")
     parser.add_argument("--same-seed", action="store_true", help="Use the same --seed for every replication instead of seed + i.")
-    parser.add_argument("--oracle-time-points", type=int, default=1000, help="Time samples in the cached oracle curve.")
+    parser.add_argument("--oracle-time-points", type=int, default=4000, help="Time samples in the cached oracle curve. Ackley oscillates once per unit of time, so a [-32, 32] span needs a few thousand samples to avoid aliasing.")
     parser.add_argument("--oracle-grid-resolution", type=int, default=33, help="Per-axis spatial grid nodes for the oracle search (use an odd number).")
     parser.add_argument("--oracle-cache", type=Path, default=None, help="Defaults to data/synthetic/<benchmark>/oracle.npz.")
     parser.add_argument("--results-dir", type=Path, default=None, help="Defaults to data/synthetic/<benchmark>/results.")
     args = parser.parse_args()
 
     benchmark = get_benchmark(args.benchmark)
-    time_span = (float(args.time_span[0]), float(args.time_span[1]))
+    span = args.time_span if args.time_span is not None else benchmark.temporal_span
+    time_span = (float(span[0]), float(span[1]))
     default_time = time_span == (0.0, 1.0)
     span_tag = "" if default_time else f"_t{time_span[0]:g}_{time_span[1]:g}"
 
