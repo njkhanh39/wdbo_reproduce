@@ -171,10 +171,16 @@ Two seeding modes:
   diagnostic mode for isolating wall-clock nondeterminism, not a paper-style
   run. The saved run `04_10_run_1_seed` was produced this way.
 
-Results are written to `data/temperature/results/`: 2 CSVs (`regret.csv`,
-`summary.csv`) and 2 plot files holding 3 panels total (regret + dataset
-size vs. duration, and regret vs. response time) — reproducing both halves
-of Figure 20. §5 explains exactly what each file and metric means.
+Results are written to a fresh timestamped directory
+`data/temperature/results/<YYYYmmdd-HHMMSS>[-label]/`, so a run never
+overwrites its predecessor; `--label paper` names it and `--results-dir`
+overrides the path entirely. §5 explains every file it contains.
+
+The optimization loop and everything downstream of it (the log, the
+summaries, the run metadata, the plots) live in
+[`../common.py`](../common.py), shared with the synthetic experiment so the
+two cannot drift apart. This script only builds the objective and parses
+flags.
 
 ## 4. What the `--seed` flag controls
 
@@ -212,8 +218,31 @@ objective and its cached oracle curve.
   the `R_t / t` convention: it keeps averaging in more queries as `t` grows,
   so it smooths out and typically trends toward a stable value. **This is
   the paper's convention and the one to compare against Figure 20.**
-- **Response time**: real wall-clock seconds one iteration took (pick a
-  point + update the model + clean stale data). Not regret — a speed metric.
+- **Time-weighted average regret up to `t`**: the same idea, but each query
+  is weighted by how long it actually stood before the next one replaced it —
+  `sum(r_i · dt_i) / sum(dt_i)`, the discrete form of `(1/t)∫r dt`. The
+  unweighted mean counts a query that stood for 3 s the same as one that
+  stood for 0.3 s, whereas §5's protocol ("two iterations of a solution are
+  separated by its response time") exists precisely so that being slow
+  costs something. The paper never says which convention it uses, so both are
+  reported; they agree when response times are stable and diverge exactly
+  when cleaning stalls.
+- **Response time** (`t_response`): real wall-clock seconds for the two tasks
+  H.1 defines it as — (i) estimating the kernel and noise hyperparameters and
+  (ii) optimizing the acquisition function. **Cleaning is not included**, and
+  neither is querying the objective (H.1: "the objective function is
+  immediately sampled"). Both still advance the wall clock — Algorithm 1
+  reads the clock *after* the removal loop — they just aren't part of the
+  metric. `t_clean` is logged separately; it is frequently comparable to
+  `t_response` in size, so conflating them overstates response time badly.
+- **Dataset size**: how many points W-DBO's internal model currently holds,
+  after stale ones are cleaned out. Floored at 2 (the cleaning loop stops at
+  `xx_tt.shape[0] > 2`).
+- **`lT` and the removal budget**: the MLE temporal lengthscale and the
+  budget `b` from Algorithm 1, both logged per query. The budget grows as
+  `(1 + alpha) ** (Δt / lT)` — it *divides by* `lT` — so an `lT` the MLE
+  drives towards zero makes the budget explode and W-DBO purge down to the
+  floor of 2. When a run misbehaves, these are the two numbers to look at.
 - **Dataset size**: how many points W-DBO's internal model currently holds,
   after stale ones are cleaned out. Floored at 2 (the cleaning loop stops at
   `xx_tt.shape[0] > 2`).
@@ -223,106 +252,161 @@ objective and its cached oracle curve.
 
 ### 5.2 The files
 
-#### `regret.csv`
+A run leaves behind three CSVs, one JSON and three PNGs. **`queries.csv` is
+the only irreplaceable one** — every other file is a view over it, and
+[`../plot.py`](../plot.py) regenerates the figures from it without re-running
+the experiment:
 
-A time series, but **not** a raw query log when `--n-seeds > 1`.
+```bash
+python experiments/plot.py data/temperature/results/20260914-120000-paper
+```
 
-- **`--n-seeds 1`**: the file *is* the raw log — one row per real iteration
-  (so the row count is however many queries that run actually made, *not* a
-  round number), with 5 columns: `sim_time, wall_time, response_time,
-  regret, dataset_size`. `regret` here is instantaneous.
-- **`--n-seeds > 1`** (how `03_modified_10_iters` and `04_10_run_1_seed`
-  were made): the file has exactly **200 rows** and 3 columns: `wall_time,
-  regret, dataset_size`. Those 200 rows are a *resampling*, not queries:
+#### `queries.csv` — the raw log
 
-  1. Each replication logs `(wall_time, instantaneous_regret, dataset_size)`
-     per query; replications differ in iteration count and in the wall
-     times they hit.
-  2. Build a fixed grid `np.linspace(0, duration_seconds, 200)` — 200
-     equally-spaced wall-clock times.
-  3. For **each replication**, piecewise-linearly interpolate its regret and
-     dataset size onto those 200 times (`np.interp`; values past a run's
-     last logged time are held flat).
-  4. **Average across the replications**: row *i* is the mean over the seeds
-     of the interpolated value at grid time *i*.
+One row per real query, for **every** seed (a `seed` column distinguishes
+them). No interpolation, no resampling, no fixed row count: a 600 s run makes
+however many queries it makes, machine-dependent. Columns:
 
-  So "200" is a hardcoded plotting resolution, and the `wall_time` column is
-  literally `linspace(0, 600, 200)` — `0, 3.015…, 6.030…, …, 600`. The
-  algorithm does *not* query exactly 200 times; a real 600s run does a few
-  hundred iterations, machine-dependent.
+| column | meaning |
+|---|---|
+| `seed`, `iteration` | which replication, and the query's index within it |
+| `sim_time` | the optimizer's normalized clock, `elapsed / duration` ∈ `[1/40, 1]` |
+| `wall_time` | elapsed real seconds at the end of the step |
+| `t_response` | H.1's response time: hyperparameter estimation + acquisition optimization |
+| `t_clean` | seconds spent in `clean()` — advances the clock, but not part of `t_response` |
+| `regret` | **instantaneous** regret of this query |
+| `dataset_size` | model dataset size after cleaning |
+| `n_removed` | how many observations this `clean()` call stripped |
+| `lambda`, `lS`, `lT`, `noise` | the MLE hyperparameters the next iteration will use |
+| `removal_budget` | Algorithm 1's budget `b` after this step |
 
-  Note this `regret` column is still **instantaneous** regret (interpolated,
-  then seed-averaged) — *not* the running average. The running-average curve
-  is computed separately for the plot (see below).
+The 15 initial observations are not in here: they are not queries the
+algorithm chose, so they are excluded from the regret log (see §3).
 
-#### `summary.csv`
+#### `per_seed.csv` — one row per replication
 
-Two headline numbers, each as `mean, variance` across replications
-(`ddof = 1` when there is more than one run):
+`iterations`, both average-regret conventions, mean `t_response` and
+`t_clean`, final/max/min dataset size, `median_lT`, and `total_removed`. This
+is the file that shows "8 seeds fine, 2 stuck at 2" at a glance, and
+`iterations` is the check on whether your machine is doing comparable work to
+the paper's (an i9-9980HK, 8 cores / 16 threads).
 
-1. **Average regret up to `t = duration_seconds`** — for each replication,
-   the mean of *all* its instantaneous regrets over the whole run; then mean
-   and variance of those per-replication numbers. This is the value the left
-   plot panel reaches at its rightmost point.
-2. **Average response time** — the mean per-query response time within each
-   replication, then mean and variance across replications.
+#### `summary.csv` — the headline numbers
 
-This is the file to quote when reporting "one number" for the whole run.
+`metric, mean, sem, n_runs` for average regret, time-weighted average regret,
+response time, clean time and iteration count. **Standard error, not
+variance**: Table 2 underlines algorithms whose confidence intervals overlap
+the best one's, so the SEM is what makes the comparison. The paper's W-DBO
+figure for Temperature is **0.68**; the script prints it alongside your own.
+
+#### `run.json` — provenance
+
+Every CLI argument, the git commit and dirty flag, hostname, CPU model,
+`torch.get_num_threads()`, and library versions. On a wall-clock-driven
+benchmark **the machine is an experimental parameter**: a slower host fits
+fewer iterations into the same 600 s and scores worse regret with no
+algorithmic difference at all. Two runs are only comparable if this file
+matches. Consequences worth acting on: never run the seeds concurrently (CPU
+contention inflates response time and silently worsens regret), and keep the
+thread count fixed across runs you intend to compare.
 
 #### `regret_and_size_vs_duration.png` (2 panels)
 
-Both panels come from `compute_duration_stats`, which — unlike `regret.csv`
-— computes each replication's **running (cumulative) average** regret first,
-*then* interpolates onto the 200-point grid, *then* takes the mean and std
-across replications.
+Each seed's **running (cumulative) average** regret is computed first, *then*
+resampled onto a shared 200-point `linspace(0, duration, 200)` wall-clock
+grid (`np.interp`; values past a seed's last query are held flat), *then*
+*then* summarised across seeds. That grid is a plotting internal — it is no
+longer written to disk.
 
-- **Left — Regret**: running average regret up to `t` on the y-axis,
-  duration (seconds) on the x-axis. Shaded band = ±1 std. dev. across
-  replications. Mirrors Figure 20 (right), regret side.
-- **Right — Dataset size**: dataset size on a **log** y-axis vs. duration,
-  same shaded-band convention. See §6 for how to read the band on this
-  panel — it can look alarming and usually isn't.
+Both panels draw the **across-seed mean**, with every seed as a faint line
+behind it. See §6.
+
+- **Left — Regret**: average regret up to `t`. Mirrors Figure 20 (right),
+  regret side.
+- **Right — Dataset size**: log y-axis. See §6 for how to read the band.
 
 #### `regret_vs_response_time.png` (1 panel)
 
-Scatter of every individual query's `(response time, instantaneous regret)`
-across all replications (light dots), plus one bold marker at the mean
-response time / mean regret with error bars (±1 std across replications).
-Mirrors Figure 20 (left) — the paper overlays one such box per baseline
-algorithm; since this script only runs W-DBO, there's just one marker here.
+Every query's `(t_response, instantaneous regret)` scattered across all
+seeds, plus **one orange marker per seed** at that seed's own average and a
+black X at the mean of those. Mirrors Figure 20 (left) — the paper overlays one
+box per baseline algorithm; running W-DBO alone, the per-seed markers are what
+show the spread.
 
-## 6. Interpreting the uncertainty bands
+#### `lengthscale_and_budget.png` (2 panels) — not in the paper
 
-**The dataset-size band on the log plot can plunge to the bottom of the
-axis. That is a plotting artifact, not a collapse of the dataset.** The
-lower edge of the band is `np.clip(size_mean - size_std, 1e-6, None)` drawn
-on a log scale. Whenever `size_std ≥ size_mean` at a grid point,
-`mean - std` is ≤ 0, gets clipped to `1e-6`, and the shaded region visually
-falls to the floor of the plot. The real dataset size never goes near zero —
-W-DBO's cleaning loop is hard-floored at 2.
+The diagnostic panel: `lT` (left) and the removal budget (right) against
+duration, one faint line per seed plus the mean, both on log axes. This is
+where a dataset collapse is explained rather than just observed.
 
-**Why the band is thin early and explodes late in a `--same-seed` run
-(`04_10_run_1_seed`).** All 10 replications start essentially identical
-(same initial points, same noise sequence) → std ≈ 0, a razor-thin band.
-They diverge *only* through wall-clock nondeterminism (§4), and that
-divergence compounds, so by the last third the runs have drifted far apart —
-visible in *both* the regret band widening and the size band. On top of
-that, W-DBO's removal budget grows multiplicatively with elapsed time
-(`budget *= (1 + alpha) ** (Δt / lT)`), so once it is large a single
-`clean()` call can strip many points at once. If even 1–2 of the 10
-replications undergo an aggressive purge near the end while the other 8 sit
-at 50–70 points, the cross-run std becomes comparable to the mean → the clip
-above fires → the band drops to the axis floor. The mean stays "consistent"
-(~50) because it is dominated by the replications that did *not* purge.
-`np.interp` holding each run's final value flat to `t = 600` smears this
-across the last few grid points rather than a single one.
+## 6. Reading the plots, and the dataset collapse
 
-**A `--n-seeds 10` run with distinct seeds (`03_modified_10_iters`)** does
-not show this "thin then exploding" pattern: the replications differ from
-step 1, so the band is broad and roughly uniform throughout, and
-`mean - std` for dataset size stays positive — no clip-to-`1e-6` crash.
+Every panel plots the **across-seed mean** as the bold black curve — the same
+statistic `summary.csv` reports — with each individual seed drawn faintly
+behind it. The per-seed lines are there because on this benchmark the mean can
+hide a split: a seed either keeps a healthy dataset (~90–150 observations) or
+collapses to the cleaning floor of 2 and stays there. In the 10-seed run under
+`results/20260914-140920-paper`, dataset size at `t = 600 s` was:
 
-## 7. What this reproduction does and doesn't match exactly
+```
+[2, 2, 2, 2, 2, 2, 49, 90, 123, 131]        mean = 40.6
+```
+
+The mean of 40.6 sits in the empty gap between the two groups. It is still what
+gets plotted and quoted, but the faint lines make the split visible rather than
+leaving it to be inferred.
+
+### What the collapse is
+
+Visible in `lengthscale_and_budget.png`, and worth knowing before you read any
+result: the removal budget is `b *= (1 + alpha) ** (Δt / lT)` — it **divides
+by** `lT`. The MLE in `model.py` is unconstrained, and it occasionally returns
+a degenerate `lT` (values as low as `5e-5` appear in `queries.csv`, meaning the
+objective decorrelates in ~30 ms of a 600 s run). One such fit multiplies the
+budget by ~2000 in a single step. From the paper run, seed 3:
+
+| it | wall | lT | budget | size | removed |
+|---|---|---|---|---|---|
+| 5 | 23.7 s | 1.00380 | 1.14 | 6 | 0 |
+| **6** | 25.9 s | **0.00005** | 3.42 | **2** | **5** |
+| 7 | 26.5 s | 0.00973 | 5.6e+08 | 2 | 1 |
+
+It is an **absorbing state**. Once collapsed, the budget's median is `1.6e+16`
+and `n_removed` is exactly 1.0 every step forever — one point added, one
+deleted — and with 2 observations the GP can never re-estimate `lT` well enough
+to escape. In that run 6 of 10 seeds collapsed; 3 died inside the first 50 s.
+
+This is untouched upstream behaviour: `model.py` is the authors' own code and
+has not been modified here. Fixing it would mean constraining the lengthscales
+(a `GreaterThan` constraint or a lognormal prior, as botorch's own
+`SingleTaskGP` ships by default) or raising the cleaning floor above 2. Neither
+is done yet — for now the plots show the collapse honestly instead of averaging
+it away.
+
+Note the headline regret is largely unaffected: that run scored **0.603 ±
+0.054** against the paper's 0.68, collapses and all.
+
+### `--same-seed` runs
+
+`saved/04_10_run_1_seed` and `results/20260915-092443-same_seed` reuse one seed
+ten times. The replications still differ, because the loop is wall-clock driven
+(§4), but they share initial points and the noise sequence, so they start
+near-identical and diverge only as timing jitter compounds. They are a
+diagnostic for that nondeterminism, not a paper-style result — and they inherit
+whatever that one seed happens to be. Seed 0 is one of the collapsing seeds,
+which is why the `same_seed` run scores **0.878 ± 0.096** against the
+distinct-seed run's **0.603 ± 0.054**: same algorithm, ~45 % worse, purely from
+the draw.
+
+## 7. A note on `saved/`
+
+The runs under `data/temperature/saved/` predate the output format described
+in §5, and predate the corrections in §3 (`alpha`, the initial-observation
+window, the response-time definition). They are kept as a record of earlier
+attempts, but they are not comparable to new runs and `plot.py` cannot read
+them — they have no `queries.csv` and no `run.json`.
+
+## 8. What this reproduction does and doesn't match exactly
 
 - **Matches**: the benchmark's definition (3D spatio-temporal, first day of
   data, activate-the-hottest-point task), the kernel choices, the 15 initial

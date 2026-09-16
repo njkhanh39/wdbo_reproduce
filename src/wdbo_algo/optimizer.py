@@ -10,7 +10,7 @@ class WDBOOptimizer:
 	"""WDBO Optimizer class, interfaces with the user
 	"""
 
-	def __init__(self, spatial_domain, spatial_kernel, temporal_kernel, spatial_kernel_args=[], temporal_kernel_args=[], n_initial_observations=15, alpha=0.25):
+	def __init__(self, spatial_domain, spatial_kernel, temporal_kernel, spatial_kernel_args=[], temporal_kernel_args=[], n_initial_observations=15, alpha=0.25, min_dataset_size=2):
 		"""Build the WDBO algorithm
 
 		Args:
@@ -22,12 +22,16 @@ class WDBOOptimizer:
 				n_initial_observations (int, optional): the number of observations to collect before starting the optimization.
 				Defaults to 15.
 				alpha (float, optional): the WDBO hyperparameter, control the removal budget. Defaults to 0.25.
+				min_dataset_size (int, optional): the cleaning loop never removes below this many observations.
+				Defaults to 2, the original behaviour. Raising it to `n_initial_observations` guards against the
+				runaway where a maximum-likelihood lT near zero explodes the budget and purges the whole dataset.
 		"""
 		self._spatial_domain = spatial_domain
 		self._d = self._spatial_domain.shape[0]
-		
+
 		self._n_initial_observations = n_initial_observations
 		self._alpha = alpha
+		self._min_dataset_size = max(int(min_dataset_size), 2)
 
 		self._spatial_kernel = spatial_kernel
 		self._spatial_kernel_wdbo = self.get_wdbo_kernel_class(self._spatial_kernel)
@@ -44,6 +48,19 @@ class WDBOOptimizer:
 		self._gpr = None
 		self._lambda, self._lS, self._lT, self._noise = None, None, None, None
 		self._current_time = None
+
+		# Diagnostics for the experiment log: the relevance of the least relevant
+		# observation as the cleaning loop first saw it, the temporal lengthscale of
+		# the model that produced it, and the budget spent this call. Recorded,
+		# never read back -- the removal rule does not use them.
+		#
+		# lT is logged twice because the two copies mean different things. The one
+		# in `_lT` is post-cleaning, i.e. what the next iteration will act on;
+		# `_last_min_lT` is the one the criterion was actually evaluated under, and
+		# since every removal refits the hyperparameters the two can differ by
+		# orders of magnitude within a single call. Calibrating a removal budget
+		# means pairing a score with the lengthscale that produced it.
+		self._last_min_criterion, self._last_min_lT, self._budget_spent = np.nan, np.nan, 0.0
 
 	def get_wdbo_kernel_class(self, gpytorch_kernel_class):
 		"""Correspondance between gpytorch kernels classes and wdbo-criterion kernels classes.
@@ -182,8 +199,9 @@ class WDBOOptimizer:
 		self._budget *= (1.0 + self._alpha) ** ((t - self._current_time) / self._lT)
 
 		# Cleaning loop for the dataset
+		self._last_min_criterion, self._last_min_lT, self._budget_spent = np.nan, np.nan, 0.0
 		min_crit = 0
-		while self._xx_tt.shape[0] > 2 and self._budget > min_crit:
+		while self._xx_tt.shape[0] > self._min_dataset_size and self._budget > min_crit:
 			# Measures observations relevancy
 			criteria = wdbo_criterion.wasserstein_criterion(
 					np.ascontiguousarray(self._xx_tt[:, :-1]),
@@ -201,6 +219,10 @@ class WDBOOptimizer:
 			indices, criteria = sorted_args, criteria[sorted_args]
 			idx_min, min_crit = (indices[0], criteria[0] + 1.0)
 
+			# The raw relevance ratio, before the +1 the multiplicative budget needs.
+			if np.isnan(self._last_min_criterion):
+				self._last_min_criterion, self._last_min_lT = float(criteria[0]), self._lT
+
 			if verbose:
 				print(f"Removal Budget: {self._budget} // Least Relevant Observation: {idx_min} // Relevancy: {min_crit} (i.e. {round(100 * min_crit / self._budget, 2)}% of budget)")
 
@@ -208,6 +230,7 @@ class WDBOOptimizer:
 			if min_crit < self._budget:
 				# Budget consumption
 				if min_crit > 1.0:
+					self._budget_spent += np.log(min_crit)
 					self._budget = self._budget / min_crit
 
 				if verbose:

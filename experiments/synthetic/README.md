@@ -9,7 +9,7 @@ Rosenbrock, Shekel, Hartmann-3, Hartmann-6, Powell).
 
 It is the analytic sibling of [`../temperature/`](../temperature/): the
 optimizer, the real-time loop, the seed handling, the CSV/plot outputs, and
-the ±1 std bands are all identical. **Only the objective differs** — a
+the plotting conventions are all identical. **Only the objective differs** — a
 closed-form function instead of an interpolated real-world surface — so this
 page focuses on that difference and defers to
 [`../temperature/README.md`](../temperature/README.md) §4–6 for everything
@@ -126,6 +126,8 @@ the compiled `wdbo_criterion` extension; see [`../../NOTE.md`](../../NOTE.md).)
 | `--seed` / `--same-seed` | 0 / off | — | see [`../temperature/README.md`](../temperature/README.md) §4 |
 | `--oracle-time-points` | 4000 | — | oracle curve resolution (§2) |
 | `--oracle-grid-resolution` | 33 | — | oracle spatial grid, per axis (§2) |
+| `--label` | none | — | names the timestamped results directory, e.g. `--label paper` |
+| `--results-dir` | none | — | write here instead of a fresh timestamped directory |
 
 Kernels and the real-time loop are identical to `temperature`: Matérn-5/2
 spatial, Matérn-3/2 temporal, clock `= elapsed / duration_seconds`. Per H.1
@@ -140,26 +142,50 @@ A full `--n-seeds 10 --duration-seconds 600` run is ~100 min of wall time
 
 ## 4. Reading the results
 
-Written to `data/synthetic/<benchmark>/results/` — same four files, same
-meanings, as the temperature experiment. See
+Written to a fresh timestamped directory
+`data/synthetic/<benchmark>/results<span tag>/<YYYYmmdd-HHMMSS>[-label]/` —
+same files, same meanings, as the temperature experiment, since both share
+[`../common.py`](../common.py). See
 [`../temperature/README.md`](../temperature/README.md) §5–6 for the full
 description; in brief:
 
-- **`regret.csv`** — with `--n-seeds > 1`, exactly 200 rows on a fixed
-  `linspace(0, 600, 200)` wall-clock grid (a resampling, *not* the query
-  count), holding the seed-averaged **instantaneous** regret and dataset
-  size.
-- **`summary.csv`** — the one-number headline: mean and variance across
-  replications of each replication's own average regret and average response
-  time. For `ackley4d` the paper's Table 2 reference is W-DBO average regret
-  ≈ **2.24**.
-- **`regret_and_size_vs_duration.png`** — left: **running** average regret vs
-  duration (±1 std band); right: dataset size vs duration on a log axis. The
-  size band can visually drop to the axis floor whenever `std ≥ mean` — a
-  clip artifact, not a real collapse (temperature README §6).
+- **`queries.csv`** — the raw per-query log, every seed, no resampling. The
+  only irreplaceable file; everything else is a view over it. Includes
+  `t_response` (H.1's definition: hyperparameter estimation + acquisition
+  optimization, *excluding* cleaning), `t_clean`, `n_removed`, and the MLE
+  hyperparameters `lambda, lS, lT, noise` plus `removal_budget` per query.
+- **`per_seed.csv`** — one row per replication: iteration count, both
+  average-regret conventions, mean response and clean time, final/max/min
+  dataset size, `median_lT`, `total_removed`.
+- **`summary.csv`** — the quotable numbers as `mean, sem, n_runs`. For
+  `ackley4d` the paper's Table 2 reference is average regret ≈ **2.24**; the
+  script prints yours next to it.
+- **`run.json`** — args, git commit, host, CPU, torch thread count, versions.
+  The benchmark is wall-clock-driven, so the machine is an experimental
+  parameter and two runs are only comparable if this matches.
+- **`regret_and_size_vs_duration.png`** — left: **average regret up to t**
+  (each seed's running cumulative mean, resampled onto a shared 200-point
+  grid); right: dataset size on a log axis. Both panels draw the across-seed
+  mean with every seed faint behind it — seed outcomes can be bimodal, so the
+  individual lines matter (temperature README §6).
 - **`regret_vs_response_time.png`** — every query scattered, plus the
-  mean ±1 std marker; the single-algorithm analogue of the paper's
-  per-benchmark left panel.
+  one marker per seed and the mean of those; the single-algorithm analogue of
+  the paper's per-benchmark left panel.
+- **`lengthscale_and_budget.png`** — not in the paper. `lT` and the removal
+  budget per seed, both log-scaled. The budget grows as
+  `(1 + alpha) ** (Δt / lT)`, so an `lT` driven towards zero explodes it and
+  purges the dataset to the floor of 2; this panel is where that gets
+  diagnosed.
+
+Re-render any figure from a finished run without repeating it:
+
+```bash
+python experiments/plot.py data/synthetic/ackley4d/results_t-32_32/<run dir>
+```
+
+Runs under `data/synthetic/ackley4d/saved/` predate this layout (and the
+corrections in §1/§3), so `plot.py` cannot read them and their numbers are not
+comparable to new ones.
 
 ## 5. Adding another benchmark
 
