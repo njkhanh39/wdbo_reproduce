@@ -101,13 +101,36 @@ their values as independent so `P(f* ≤ z) ≈ Π_m Φ((z − μ_m)/σ_m)`, rea
 25/50/75 percentiles off that CDF by bisection, fit a Gumbel by percentile
 matching, and inverse-sample.
 
-Sampled **once per t from the full-D posterior and shared across all i**, per
-Week 2 §3.1: doing it per leave-one-out posterior would cost `n·|T|` Gumbel fits
-per clean instead of `|T|`, for a correction that is rank-one in a posterior
-conditioned on `n` points.
+Sampled **per leave-one-out posterior by default**: `I(y_i ; f*_t | D̃_i)`
+conditions on `D̃_i`, so the `f̂*` set that estimates it should come from `D̃_i`
+too, not from a posterior that still contains the observation being scored. The
+candidate moments under `D̃_i` are the same rank-one correction as §2 applied to
+the candidate set,
 
-Two implementation notes:
+```
+E[f_m | D̃_i]   = μ_m − M_im · â_i / A_ii
+Var[f_m | D̃_i] = σ²_m + M_im² / A_ii,     M = A·C_M
+```
 
+so forming all `n` of them costs one matrix product. What is *not* free is the
+max-value solve on top: `n·|T|` Gumbel fits per clean instead of `|T|`. Measured
+at `--mi-candidates 512`, `--mi-times 8`: 0.03 s → 0.6 s at `n = 50`, 0.11 s →
+5.0 s at `n = 250`. Under a fixed wall-clock budget that is fewer queries, so
+`--mi-fstar-full` restores the shared full-`D` sample set (Week 2 §3.1's
+argument: the correction is rank-one in a posterior conditioned on `n` points)
+for runs where the cost matters more than the conditioning.
+
+Three implementation notes:
+
+- The per-`i` percentile solves are **batched**: one active set of `n·3` scalar
+  roots solved by safeguarded Newton, roots dropping out as they converge. A
+  Python loop over `brentq` costs the same as everything else in the criterion
+  put together at these sizes.
+- The Gumbel inverse-sampling uses **common random numbers across `i`** — one
+  set of uniforms, `n` different Gumbel parameters. Each `f̂*` row is still a
+  correct marginal draw; sharing the uniforms cancels Monte-Carlo noise out of
+  the comparison the removal loop actually makes, which is `argmin_i R(i)`, and
+  makes the result independent of the order the dataset is stored in.
 - Use the **latent** posterior, not `SpaceTimeGPModel.posterior()`, which wraps
   in `self.likelihood(...)` and so adds `σ_n²`. `f*` is a maximum of `f`, not
   of `y`.

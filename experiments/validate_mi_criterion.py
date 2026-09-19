@@ -29,6 +29,7 @@ from scipy.stats import truncnorm
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from wdbo_algo.mi_criterion import (  # noqa: E402
+    leave_one_out_candidate_moments,
     leave_one_out_moments,
     matern,
     mi_criterion,
@@ -108,6 +109,43 @@ def test_leave_one_out_moments():
 
     for name, err in errors.items():
         check(f"{name} matches refit", err < 1e-9, f"max abs error {err:.2e}")
+
+
+def test_leave_one_out_candidate_moments():
+    """Same check for the candidate posteriors that `fstar_source="loo"` samples from.
+
+    With `f*_t` drawn per leave-one-out posterior, the whole default path rests
+    on this second rank-one identity; get it wrong and `f*_t` is sampled from a
+    posterior that is merely close to `D_i`, which no downstream test would catch.
+    """
+    print("\n1b. Leave-one-out candidate moments vs. explicit refit")
+    n, d, m, mean_const, t = 11, 3, 9, 0.4, 0.83
+    xx, tt, yy = dataset(n, d, seed=1)
+    candidates = np.random.default_rng(5).random((m, d))
+
+    A = np.linalg.inv(kernel(xx, tt, xx, tt) + NOISE * np.eye(n))
+    dA = np.diag(A)
+    ahat = A @ (yy - mean_const)
+    CM = kernel(xx, tt, candidates, np.full(m, t))
+    mean_loo, var_loo = leave_one_out_candidate_moments(A, dA, ahat, CM, LAM, mean_const)
+
+    err_mean = err_var = 0.0
+    for i in range(n):
+        keep = [j for j in range(n) if j != i]
+        Ai = np.linalg.inv(kernel(xx[keep], tt[keep], xx[keep], tt[keep]) + NOISE * np.eye(n - 1))
+        kv = kernel(xx[keep], tt[keep], candidates, np.full(m, t))
+
+        ref_mean = mean_const + kv.T @ Ai @ (yy[keep] - mean_const)
+        ref_var = LAM - np.einsum("jm,jm->m", kv, Ai @ kv)
+        err_mean = max(err_mean, float(np.abs(ref_mean - mean_loo[i]).max()))
+        err_var = max(err_var, float(np.abs(ref_var - var_loo[i]).max()))
+
+    check("candidate mean matches refit", err_mean < 1e-9, f"max abs error {err_mean:.2e}")
+    check("candidate variance matches refit", err_var < 1e-9, f"max abs error {err_var:.2e}")
+    # Dropping data cannot sharpen the posterior; the correction is +M^2/A_ii.
+    full_var = LAM - np.einsum("jm,jm->m", CM, A @ CM)
+    check("dropping an observation never lowers the candidate variance",
+          bool(np.all(var_loo >= full_var[None, :] - 1e-12)))
 
 
 def test_permutation_invariance():
@@ -225,6 +263,22 @@ def test_gumbel_sampler():
         check(f"sample quantile p={p:.2f} matches the max-value CDF", abs(empirical - target) < 0.02,
               f"target {target:.4f} vs empirical {empirical:.4f}")
 
+    # The batched path is the one `fstar_source="loo"` uses, and it solves its
+    # percentiles by a different route (safeguarded Newton over an active set,
+    # not one brentq per problem), so it is checked against the 1-D path rather
+    # than assumed to follow from it.
+    mus = np.stack([mu, mu + 1.5, mu * 0.5 - 2.0])
+    sigmas = np.stack([sigma, sigma * 2.0, sigma * 0.3])
+    batched = sample_max_values_gumbel(mus, sigmas, 200_000, np.random.default_rng(4))
+    check("batched sampling returns one row per problem", batched.shape == (3, 200_000))
+
+    err = 0.0
+    for row in range(3):
+        single = sample_max_values_gumbel(mus[row], sigmas[row], 200_000, np.random.default_rng(4))
+        for p in (0.25, 0.50, 0.75):
+            err = max(err, abs(float(np.quantile(batched[row], p)) - float(np.quantile(single, p))))
+    check("batched rows match the single-problem sampler", err < 0.01, f"max quantile gap {err:.2e}")
+
 
 def test_time_grid():
     """Weights sum to 1, cover the intended horizon, and decay like the kernel."""
@@ -302,12 +356,20 @@ def test_cost():
     print("\n8. Cost at realistic dataset sizes")
     for n in (50, 150, 250):
         xx, tt, yy = dataset(n, 3, seed=n)
-        rng = np.random.default_rng(0)
-        mark = time.time()
-        mi_criterion(xx, tt, yy, t0=1.0, lam=LAM, lS=LS, lT=LT, noise_var=NOISE,
-                     n_times=8, n_max_samples=32, n_candidates=512, rng=rng)
-        elapsed = time.time() - mark
-        check(f"n={n} under 0.15 s", elapsed < 0.15, f"{elapsed * 1000:.1f} ms")
+        for source, budget in (("full", 0.15), ("loo", 12.0)):
+            mark = time.time()
+            mi_criterion(xx, tt, yy, t0=1.0, lam=LAM, lS=LS, lT=LT, noise_var=NOISE,
+                         n_times=8, n_max_samples=32, n_candidates=512,
+                         fstar_source=source, rng=np.random.default_rng(0))
+            elapsed = time.time() - mark
+            check(f"n={n} fstar_source={source} under {budget:g} s", elapsed < budget,
+                  f"{elapsed * 1000:.1f} ms")
+
+    # The default costs one max-value solve per observation rather than one in
+    # total, so it is the best part of n times dearer and the budget above is
+    # loose. At a fixed wall-clock experiment budget that buys fewer queries,
+    # which is the trade --mi-fstar-full exists to undo; the timings are printed
+    # so that choice rests on measurements and not on the ratio being "about n".
 
 
 def main():
@@ -315,7 +377,8 @@ def main():
     # zero in a Matern tail or a max-value CDF. A division by zero or a NaN is
     # not, and those are the ones this module is built to avoid, so raise on them.
     np.seterr(divide="raise", invalid="raise", over="raise", under="ignore")
-    for test in (test_leave_one_out_moments, test_permutation_invariance, test_truncated_variance,
+    for test in (test_leave_one_out_moments, test_leave_one_out_candidate_moments,
+                 test_permutation_invariance, test_truncated_variance,
                  test_conditional_variance_monte_carlo, test_gumbel_sampler, test_time_grid,
                  test_relevance_behaviour, test_cost):
         test()

@@ -15,8 +15,14 @@ removal budget additively to match.
 Estimator (following the MES/OPES line of work):
 
   1. `f*_t` is sampled by fitting a Gumbel to the max-value CDF over a finite
-     candidate set, exactly as in MES (Wang & Jegelka, ICML 2017). One sample
-     set per `t`, drawn from the full-`D` posterior and shared across every `i`.
+     candidate set, exactly as in MES (Wang & Jegelka, ICML 2017). By default
+     one sample set per `(i, t)`, drawn from the same leave-one-out posterior
+     `D_i` that the rest of the term conditions on -- which is what the
+     definition of `I(y_i ; f*_t | D_i)` asks for. Passing
+     `fstar_source="full"` reverts to one shared sample set per `t` drawn from
+     the full-`D` posterior: `|T|` Gumbel fits per clean instead of `n.|T|`,
+     at the cost of conditioning `f*_t` on the very observation whose
+     information content is being measured.
 
   2. `H(y_i | f*_t, D_i)` is upper-bounded by the Gaussian entropy of matching
      variance (OPES), which turns the whole problem into computing
@@ -33,7 +39,6 @@ states the two results it uses.
 """
 import numpy as np
 from scipy.linalg import cho_factor, cho_solve
-from scipy.optimize import brentq
 from scipy.special import log_ndtr
 from scipy.stats import qmc
 
@@ -140,50 +145,120 @@ def sample_max_values_gumbel(mu, sigma, n_samples, rng):
 	`n x 1`-shaped moments, while `SpaceTimeGPModel` returns a bare gpytorch
 	`MultivariateNormal`.
 
+	`mu` and `sigma` may be `r x n_candidates`, in which case the `r` independent
+	max-value problems are solved together and `r x n_samples` samples come back.
+	That is not a convenience: with `fstar_source="loo"` there is one problem per
+	observation per future time, and a Python-level loop over `brentq` dominates
+	the whole criterion. The batched path bisects all of them on the same fixed
+	iteration count instead, which is one vectorized pass over an `r x n_candidates`
+	array per step.
+
 	Args:
-			mu (np.array): posterior mean of the latent f at the candidate points
-			sigma (np.array): posterior standard deviation at the candidate points
-			n_samples (int): number of max-value samples to draw
+			mu (np.array): posterior mean of the latent f at the candidate points,
+			either `n_candidates` or `r x n_candidates`
+			sigma (np.array): posterior standard deviation, same shape as `mu`
+			n_samples (int): number of max-value samples to draw per problem
 			rng (np.random.Generator): the source of randomness
 
 	Returns:
-			np.array: `n_samples` samples of f*
+			np.array: `n_samples` samples of f*, or `r x n_samples` if `mu` was 2-D
 	"""
-	sigma = np.maximum(np.asarray(sigma, dtype=float), 1e-8)
 	mu = np.asarray(mu, dtype=float)
+	batched = mu.ndim == 2
+	mu = np.atleast_2d(mu)
+	sigma = np.maximum(np.atleast_2d(np.asarray(sigma, dtype=float)), 1e-8)
+	r = mu.shape[0]
 
-	def log_cdf(z):
-		return log_ndtr((z - mu) / sigma).sum()
+	# The r problems x 3 percentiles are flattened into one list of independent
+	# scalar roots, so a solved one can simply be dropped from the work array.
+	rows = np.repeat(np.arange(r), 3)
+	target = np.tile(np.log(np.array([0.25, 0.50, 0.75])), r)
 
-	lo = float((mu - 3.0 * sigma).min())
-	hi = float((mu + 5.0 * sigma).max())
+	def log_cdf(z, act, grad=False):
+		"""`log P(f* <= z)` for the active roots, and optionally its derivative."""
+		idx = rows[act]
+		u = (z[:, None] - mu[idx]) / sigma[idx]
+		lcdf = log_ndtr(u)
+		if not grad:
+			return lcdf.sum(axis=-1), None
+
+		hazard = np.exp(-0.5 * u * u - 0.5 * LOG_2PI - lcdf) / sigma[idx]
+		return lcdf.sum(axis=-1), hazard.sum(axis=-1)
+
+	lo = np.repeat((mu - 3.0 * sigma).min(axis=1), 3)
+	hi = np.repeat((mu + 5.0 * sigma).max(axis=1), 3)
+
 	# The product of many CDFs is much sharper than any single one, so the
 	# textbook bracket can sit entirely on one side of the percentiles. Widen
 	# until it straddles them; geometric growth, so this ends quickly.
-	span = max(hi - lo, 1e-6)
+	everything = np.arange(rows.size)
+	span = np.maximum(hi - lo, 1e-6)
 	for _ in range(64):
-		if log_cdf(lo) <= np.log(0.25):
+		bad = log_cdf(lo, everything)[0] > target
+		if not bad.any():
 			break
-		lo -= span
-		span *= 2.0
-	span = max(hi - lo, 1e-6)
+		lo[bad] -= span[bad]
+		span[bad] *= 2.0
+	span = np.maximum(hi - lo, 1e-6)
 	for _ in range(64):
-		if log_cdf(hi) >= np.log(0.75):
+		bad = log_cdf(hi, everything)[0] < target
+		if not bad.any():
 			break
-		hi += span
-		span *= 2.0
+		hi[bad] += span[bad]
+		span[bad] *= 2.0
 
-	# Bisect on log P rather than P: the product of 500-odd CDFs underflows to a
-	# flat zero well inside the bracket, which leaves brentq nothing to descend.
-	q25, q50, q75 = (brentq(lambda z: log_cdf(z) - np.log(p), lo, hi) for p in (0.25, 0.50, 0.75))
+	# Solve on log P rather than P: the product of 500-odd CDFs underflows to a
+	# flat zero well inside the bracket, which leaves a root finder nothing to
+	# descend. log P is monotone in z, so this is safeguarded Newton -- the
+	# bracket is kept and a step that would leave it becomes a bisection. Roots
+	# drop out of `act` as they converge, which is what keeps the batched solve
+	# cheaper than the per-problem one it replaces: with `fstar_source="loo"`
+	# there is one problem per observation per future time.
+	z = 0.5 * (lo + hi)
+	act = everything
+	for _ in range(80):
+		za, loa, hia = z[act], lo[act], hi[act]
+		value, slope = log_cdf(za, act, grad=True)
+		residual = value - target[act]
+
+		descend = residual < 0.0
+		lo[act] = np.where(descend, za, loa)
+		hi[act] = np.where(descend, hia, za)
+
+		done = np.abs(residual) < 1e-10
+		if done.all():
+			break
+
+		# Step only the roots that are still running: `z` holds the answer, and a
+		# root that has converged must keep the value it converged to rather than
+		# be moved once more on its way out of `act`.
+		act = act[~done]
+		za, residual, slope = za[~done], residual[~done], slope[~done]
+
+		newton = za - residual / np.maximum(slope, 1e-300)
+		inside = (slope > 0.0) & (newton > lo[act]) & (newton < hi[act])
+		z[act] = np.where(inside, newton, 0.5 * (lo[act] + hi[act]))
+
+	q25, q50, q75 = z.reshape(r, 3).T
+
 
 	# Percentile matching for Gumbel(a, b): the denominator is negative and
 	# q25 - q75 is too, so b comes out positive.
 	b = (q25 - q75) / (np.log(np.log(4.0 / 3.0)) - np.log(np.log(4.0)))
-	b = max(b, 1e-10)
+	b = np.maximum(b, 1e-10)
 	a = q50 + b * np.log(np.log(2.0))
 
-	return a - b * np.log(-np.log(rng.random(n_samples)))
+	# One set of uniforms, shared by every problem in the batch. The criterion
+	# compares its r problems against each other -- with `fstar_source="loo"` they
+	# are the n leave-one-out posteriors and the loop takes an argmin over them --
+	# so common random numbers cancel most of the Monte-Carlo noise out of that
+	# comparison. Each row is still a correct marginal draw from its own Gumbel;
+	# only the coupling across rows changes. It also makes the result independent
+	# of the order the dataset happens to be stored in, which a per-row draw is not.
+	uniform = rng.random(n_samples)[None, :]
+	samples = a[:, None] - b[:, None] * np.log(-np.log(uniform))
+
+	return samples if batched else samples[0]
 
 
 def time_grid(t0, lT, temporal_nu, n_times, horizon_lengthscales, weight, clip_horizon=None):
@@ -303,10 +378,46 @@ def leave_one_out_moments(A, dA, ahat, C, lam, mean_const):
 	return rho2, mean_v, var_v
 
 
+def leave_one_out_candidate_moments(A, dA, ahat, CM, lam, mean_const):
+	"""The posterior of `f(x_m, t)` at every candidate `m` under `D_i`, for every `i`.
+
+	The same rank-one correction as `leave_one_out_moments`, applied to the
+	candidate set instead of to the observations' own locations. With `M = A CM`
+	and `mu`, `s2` the full-data moments at the candidates:
+
+		E[f_m | D_i]   = mu_m - M_im . ahat_i / A_ii
+		Var[f_m | D_i] = s2_m + M_im^2 / A_ii
+
+	The variance *grows*, as it must: dropping an observation can only make the
+	posterior less certain. Forming the `n` candidate posteriors this way costs
+	one `n x n_candidates` matrix product, not `n` refits.
+
+	Args:
+			A (np.array): `n x n` inverse of the full-data covariance matrix
+			dA (np.array): its diagonal
+			ahat (np.array): `A @ (y - mean_const)`
+			CM (np.array): `n x n_candidates` cross-covariance to the candidates
+			lam (float): the kernel outputscale
+			mean_const (float): the GP's constant mean
+
+	Returns:
+			(np.array, np.array): `n x n_candidates` means and variances, row `i`
+			holding the posterior under `D_i`
+	"""
+	M = A @ CM
+	mu = mean_const + CM.T @ ahat
+	s2 = lam - np.einsum("jm,jm->m", CM, M)
+
+	mean_loo = mu[None, :] - M * (ahat / dA)[:, None]
+	var_loo = np.maximum(s2[None, :] + M * M / dA[:, None], 1e-12)
+
+	return mean_loo, var_loo
+
+
 def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
                  spatial_nu=2.5, temporal_nu=1.5, n_times=8, horizon_lengthscales=3.0,
                  n_max_samples=32, n_candidates=512, weight="kernel",
-                 clip_horizon=None, rng=None, jitter=1e-8):
+                 fstar_source="loo", clip_horizon=None, rng=None, jitter=1e-8):
 	"""Score every observation by its mutual information with the future maximum.
 
 	The returned relevance is in nats and is non-negative by construction. It is a
@@ -347,6 +458,12 @@ def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
 			n_candidates (int, optional): candidate points discretizing X for the
 			max-value CDF. Defaults to 512.
 			weight (str, optional): "kernel" or "uniform". Defaults to "kernel".
+			fstar_source (str, optional): which posterior `f*_t` is sampled from.
+			"loo" draws a separate sample set from each leave-one-out posterior
+			`D_i`, as the definition of the conditional mutual information requires;
+			"full" draws one set from the full-`D` posterior and shares it across
+			every `i`, which is `n` times cheaper but conditions `f*_t` on the
+			observation being scored. Defaults to "loo".
 			clip_horizon (float, optional): cap the future horizon at this absolute
 			time. Defaults to None.
 			rng (np.random.Generator, optional): the source of randomness.
@@ -355,6 +472,9 @@ def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
 	Returns:
 			np.array: the relevance of each observation, in nats
 	"""
+	if fstar_source not in ("loo", "full"):
+		raise ValueError(f"Unknown fstar_source {fstar_source!r} (expected 'loo' or 'full')")
+
 	rng = np.random.default_rng() if rng is None else rng
 	xx = np.asarray(xx, dtype=float)
 	tt = np.asarray(tt, dtype=float).ravel()
@@ -383,18 +503,25 @@ def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
 		# The t-dependent factor of the cross-covariances, shared by both Grams.
 		scale = (lam * matern(np.abs(tt - t) / lT, temporal_nu))[:, None]
 
-		# f*_t, sampled once from the full-data posterior and shared across every
-		# i. Week 2, 3.1: doing it per leave-one-out posterior instead would cost
-		# n.|T| Gumbel fits per clean rather than |T|, for a correction that is
-		# rank-one in a posterior conditioned on n points.
 		CM = scale * KSM
-		mean_m = mean_const + CM.T @ ahat
-		var_m = np.maximum(lam - np.einsum("jm,jm->m", CM, A @ CM), 1e-12)
-		fstar = sample_max_values_gumbel(mean_m, np.sqrt(var_m), n_max_samples, rng)
+		if fstar_source == "loo":
+			# f*_t drawn from each D_i in turn, so the sample set entering
+			# I(y_i ; f*_t | D_i) is conditioned on the same data the rest of the
+			# term is. The moments are a rank-one correction of the full-data ones
+			# (one matrix product for all i); only the n Gumbel fits are extra.
+			mean_loo, var_loo = leave_one_out_candidate_moments(A, dA, ahat, CM, lam, mean_const)
+			fstar = sample_max_values_gumbel(mean_loo, np.sqrt(var_loo), n_max_samples, rng)
+		else:
+			# One sample set from the full-data posterior, shared across every i:
+			# |T| Gumbel fits per clean rather than n.|T|, at the price of letting
+			# observation i inform the f*_t it is being scored against.
+			mean_m = mean_const + CM.T @ ahat
+			var_m = np.maximum(lam - np.einsum("jm,jm->m", CM, A @ CM), 1e-12)
+			fstar = sample_max_values_gumbel(mean_m, np.sqrt(var_m), n_max_samples, rng)[None, :]
 
 		rho2, mean_v, var_v = leave_one_out_moments(A, dA, ahat, scale * KS, lam, mean_const)
 
-		gamma = (fstar[None, :] - mean_v[:, None]) / np.sqrt(var_v)[:, None]
+		gamma = (fstar - mean_v[:, None]) / np.sqrt(var_v)[:, None]
 		# -0.5 log(1 - z) via log1p: a stale observation has z ~ 1e-20 or smaller,
 		# where forming (1 - z) first would round it away to a relevance of exactly
 		# zero. The whole point of the criterion is to rank those observations

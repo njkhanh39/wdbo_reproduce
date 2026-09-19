@@ -36,7 +36,7 @@ class MIDBOOptimizer(WDBOOptimizer):
 	             temporal_kernel_args=[], n_initial_observations=15, alpha=1e-11,
 	             min_dataset_size=15, budget_cap=None, max_removals_per_clean=None,
 	             n_times=8, horizon_lengthscales=3.0, n_max_samples=32, n_candidates=512,
-	             weight="kernel", clip_horizon=None, seed=None):
+	             weight="kernel", fstar_source="loo", clip_horizon=None, seed=None):
 		"""Build the MI-criterion DBO algorithm.
 
 		Args:
@@ -61,6 +61,8 @@ class MIDBOOptimizer(WDBOOptimizer):
 				n_max_samples (int, optional): Monte-Carlo samples of f*_t. Defaults to 32.
 				n_candidates (int, optional): candidate points discretizing the space. Defaults to 512.
 				weight (str, optional): "kernel" or "uniform" weighting of future times. Defaults to "kernel".
+				fstar_source (str, optional): "loo" samples f*_t from each leave-one-out posterior, "full"
+				from the full-data posterior once per future time. Defaults to "loo".
 				clip_horizon (float, optional): cap the future horizon at this absolute time. Defaults to None.
 				seed (int, optional): seed for the criterion's own sampling. Defaults to None.
 		"""
@@ -85,7 +87,8 @@ class MIDBOOptimizer(WDBOOptimizer):
 		self._rng = np.random.default_rng(seed)
 		self._criterion_options = dict(n_times=n_times, horizon_lengthscales=horizon_lengthscales,
 		                               n_max_samples=n_max_samples, n_candidates=n_candidates,
-		                               weight=weight, clip_horizon=clip_horizon)
+		                               weight=weight, fstar_source=fstar_source,
+		                               clip_horizon=clip_horizon)
 
 	def relevance(self, t):
 		"""Score every stored observation by its mutual information with the future maximum.

@@ -558,6 +558,11 @@ def add_criterion_arguments(parser):
     parser.add_argument("--mi-weight", choices=("kernel", "uniform"), default="kernel",
                         help="Weighting of future times: proportional to the temporal kernel, or flat. "
                              "Measured effect is a uniform factor of ~2 in magnitude and almost none on ranking.")
+    parser.add_argument("--mi-fstar-full", action="store_true",
+                        help="Sample f*_t once from the full-data posterior and share it across every "
+                             "observation, instead of the default per-leave-one-out sampling. Cheaper "
+                             "(one Gumbel fit per future time instead of n), but conditions f*_t on the "
+                             "observation being scored.")
     parser.add_argument("--mi-clip-horizon", action="store_true",
                         help="Cap the criterion's future horizon at the end of the run (t = 1) instead of "
                              "letting it run as far as the model's own lengthscale reaches.")
@@ -588,9 +593,11 @@ def criterion_settings(args) -> tuple[str, float, dict, str]:
         n_max_samples=args.mi_max_samples,
         n_candidates=args.mi_candidates,
         weight=args.mi_weight,
+        fstar_source="full" if args.mi_fstar_full else "loo",
         clip_horizon=1.0 if args.mi_clip_horizon else None,
     )
-    return criterion, args.mi_alpha, mi_options, f"mi, alpha={args.mi_alpha:g} nats"
+    fstar_note = "" if mi_options["fstar_source"] == "loo" else ", f* from full D"
+    return criterion, args.mi_alpha, mi_options, f"mi, alpha={args.mi_alpha:g} nats{fstar_note}"
 
 
 def print_headline(rows: list[dict], reference: float | None = None):
