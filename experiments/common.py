@@ -28,10 +28,20 @@ compute budget, it also made the environment drift three times faster, so the
 were different problems. `env_speed` breaks that: change `H` to change the
 budget, change `env_speed` to change the difficulty, never both at once.
 
-Design note: `run_once` writes a *raw* log, one row per real query. It is the
-only irreplaceable artifact a run produces; `per_seed.csv`, `summary.csv` and
-every plot are views over it, recomputable by `plot.py` without re-running the
-experiment (which costs 10 minutes per seed).
+Design note: `run_once` writes a *raw* log, one row per query plus one opening
+`INITIAL_ROW`. It is the only irreplaceable artifact a run produces;
+`per_seed.csv`, `summary.csv` and every plot are views over it, recomputable
+by `plot.py` without re-running the experiment (which costs 10 minutes per
+seed).
+
+The log records the queried point `x`, its reading `y`, the noise-free
+`true_value`, and the wall-clock instant each stage of the iteration happened
+at. That is what makes a run *re-scorable*: the headline metric for a live
+system is the time-average of `f*(t) - f(x_held(t), t)`, where `x_held(t)` is
+the configuration actually in force, and no amount of post-processing can
+recover that from regret snapshots alone. Regret is computed in the loop too,
+but only as a cheap diagnostic; the authoritative number comes from a scoring
+pass over this log.
 """
 from __future__ import annotations
 
@@ -73,13 +83,61 @@ CRITERIA = ("wasserstein", "mi", "none")
 # wall times, so they have to be resampled onto a shared grid before averaging.
 GRID_POINTS = 200
 
-QUERY_FIELDS = [
-    "seed", "iteration", "env_time", "wall_time",
-    "t_acq", "t_eval", "t_fit", "t_acq_fit", "t_clean",
-    "regret", "dataset_size", "n_removed",
-    "lambda", "lS", "lT", "noise", "removal_budget",
-    "min_criterion", "criterion_lT", "budget_spent",
-]
+# The row index of the pseudo-query describing the configuration the run
+# starts with: the last observation of the initial design. It is not a query
+# the algorithm chose, so every metric excludes it (see `queries_only`), but
+# it is the configuration in force from wall-clock zero until the first real
+# query applies, so a post-hoc scorer cannot integrate the opening stretch
+# without it.
+INITIAL_ROW = -1
+
+
+def query_fields(spatial_dim: int) -> list[str]:
+    """Column order for `queries.csv`, given the benchmark's spatial dimension.
+
+    The spatial dimension varies by benchmark (3 for ackley4d, 2 for
+    temperature), so `x` is stored as flat `x_0 .. x_{d-1}` columns rather
+    than a packed JSON string: pandas, awk and a spreadsheet can all read the
+    flat form, and `load_run` reassembles it with `query_point`.
+
+    Timestamps are all elapsed seconds since the optimization loop's zero, so
+    a scorer can rebuild the step function `x_held(t)` without consulting
+    anything else, and map it onto environment time with `env_start` and
+    `env_speed` from `per_seed.csv` / `run.json`.
+    """
+    return [
+        "seed", "iteration", "env_time", "wall_time",
+        # When, in real seconds, each stage of the iteration happened.
+        "t_iter_start", "t_apply", "t_result", "t_update_done",
+        # How long each stage took.
+        "t_acq", "t_eval", "t_fit", "t_acq_fit", "t_clean",
+        # What was queried and what came back.
+        *[f"x_{i}" for i in range(spatial_dim)], "y", "true_value", "regret",
+        "dataset_size", "n_removed",
+        "lambda", "lS", "lT", "noise", "removal_budget",
+        "min_criterion", "criterion_lT", "budget_spent",
+    ]
+
+
+def spatial_dim_of(run: list[dict]) -> int:
+    """How many `x_i` columns a log has."""
+    return sum(1 for key in run[0] if key.startswith("x_"))
+
+
+def query_point(row: dict) -> np.ndarray:
+    """The configuration a log row queried, reassembled from its `x_i` columns."""
+    return np.array([row[f"x_{i}"] for i in range(sum(1 for k in row if k.startswith("x_")))])
+
+
+def queries_only(run: list[dict]) -> list[dict]:
+    """The rows the algorithm actually chose, i.e. everything but `INITIAL_ROW`.
+
+    Every reported metric goes through this. The initial design is a warm start
+    handed to the optimizer, so scoring it would credit or blame an arm for
+    points it never selected -- and it has no timings to average, since it
+    predates the wall clock.
+    """
+    return [row for row in run if row["iteration"] >= 0]
 
 
 # --------------------------------------------------------------------------
@@ -249,10 +307,40 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         rng.uniform(0.0, schedule["warmup_span"], n_initial_observations))
     for t_env in warmup_times:
         x = optimizer.next_query(t_env)
-        optimizer.tell(x, t_env, objective.evaluate(x, t_env) + rng.normal(0.0, objective.noise_std))
+        true_value = objective.evaluate(x, t_env)
+        y = true_value + rng.normal(0.0, objective.noise_std)
+        optimizer.tell(x, t_env, y)
     warmup_seconds = time.perf_counter() - warmup_mark
 
-    log: list[dict] = []
+    # The last initial observation is the configuration the system is running
+    # when the clock starts, and it stays in force until the first real query
+    # applies. Logged as `INITIAL_ROW` so the opening stretch of the run can be
+    # scored; excluded from every metric by `queries_only`. Its stage timings
+    # are NaN because it predates the wall clock.
+    log: list[dict] = [{
+        "seed": seed,
+        "iteration": INITIAL_ROW,
+        "env_time": float(warmup_times[-1]),
+        "wall_time": 0.0,
+        "t_iter_start": 0.0, "t_apply": 0.0, "t_result": 0.0, "t_update_done": 0.0,
+        "t_acq": float("nan"), "t_eval": float("nan"), "t_fit": float("nan"),
+        "t_acq_fit": float("nan"), "t_clean": float("nan"),
+        **{f"x_{i}": float(v) for i, v in enumerate(np.ravel(x))},
+        "y": y,
+        "true_value": true_value,
+        "regret": objective.oracle(float(warmup_times[-1])) - true_value,
+        "dataset_size": optimizer.dataset_size(),
+        "n_removed": 0,
+        "lambda": optimizer._lambda,
+        "lS": optimizer._lS,
+        "lT": optimizer._lT,
+        "noise": optimizer._noise,
+        "removal_budget": optimizer._budget,
+        "min_criterion": float("nan"),
+        "criterion_lT": float("nan"),
+        "budget_spent": 0.0,
+    }]
+
     start = time.perf_counter()
     overran = False
 
@@ -260,37 +348,42 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         # Check the deadline BEFORE committing to a query: a query started with
         # no budget left would be scored on an environment the run is not
         # supposed to reach. `H` is a hard stop, not a target to overshoot.
-        elapsed = time.perf_counter() - start
-        if elapsed >= duration_seconds:
+        t_iter_start = time.perf_counter() - start
+        if t_iter_start >= duration_seconds:
             break
-        t_env = env_start + env_speed * elapsed
+        t_env = env_start + env_speed * t_iter_start
 
-        # (ii) optimize the acquisition function.
-        mark = time.perf_counter()
+        # (ii) optimize the acquisition function. The previous configuration is
+        # still the one in force throughout this: x_i does not exist yet.
         x = optimizer.next_query(t_env)
-        t_acq = time.perf_counter() - mark
+        t_apply = time.perf_counter() - start
+        t_acq = t_apply - t_iter_start
 
         # H.1: "the objective function is immediately sampled" -- querying f is
         # the experiment harness's cost, not the algorithm's, so it is timed out
         # of the response time (it still advances the wall clock).
-        mark = time.perf_counter()
+        #
+        # `t_apply` is when x_i takes effect and `t_result` is when its reading
+        # is in hand. A post-hoc scorer treats x_i as held over
+        # [t_apply_i, t_apply_{i+1}).
         true_value = objective.evaluate(x, t_env)
         y = true_value + rng.normal(0.0, objective.noise_std)
-        t_eval = time.perf_counter() - mark
+        t_result = time.perf_counter() - start
+        t_eval = t_result - t_apply
 
         # (i) condition the GP and re-estimate the kernel and noise parameters.
-        mark = time.perf_counter()
         optimizer.tell(x, t_env, y)
-        t_fit = time.perf_counter() - mark
+        t_update_done = time.perf_counter() - start
+        t_fit = t_update_done - t_result
 
         # Removing stale observations advances the wall clock (Algorithm 1 reads
         # the clock after the removal loop) but is NOT part of the response time:
         # H.1 defines that as the sum of (i) and (ii) only.
         size_before = optimizer.dataset_size()
-        mark = time.perf_counter()
         if criterion != "none":
             optimizer.clean(t_env)
         step_end = time.perf_counter()
+        t_step_end = step_end - start
 
         # The MLE hyperparameters and removal budget as the next iteration will
         # see them. Read off private attributes: `wdbo_algo` is vendored in this
@@ -298,16 +391,24 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         # story behind a dataset collapse.
         log.append({
             "seed": seed,
-            "iteration": len(log),
+            "iteration": len(log) - 1,  # the INITIAL_ROW occupies log[0]
             "env_time": t_env,
-            "wall_time": step_end - start,
+            "wall_time": t_step_end,
+            # When each stage happened, so `x_held(t)` can be rebuilt offline.
+            "t_iter_start": t_iter_start,
+            "t_apply": t_apply,
+            "t_result": t_result,
+            "t_update_done": t_update_done,
             # H.1's response time is (i) + (ii) only; the parts are logged
             # separately so a slow arm can be blamed on the right stage.
             "t_acq": t_acq,
             "t_eval": t_eval,
             "t_fit": t_fit,
             "t_acq_fit": t_acq + t_fit,
-            "t_clean": step_end - mark,
+            "t_clean": t_step_end - t_update_done,
+            **{f"x_{i}": float(v) for i, v in enumerate(np.ravel(x))},
+            "y": y,
+            "true_value": true_value,
             "regret": objective.oracle(t_env) - true_value,
             "dataset_size": optimizer.dataset_size(),
             "n_removed": size_before - optimizer.dataset_size(),
@@ -330,11 +431,10 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         # let it finish -- killing a half-conditioned GP would corrupt the run --
         # but record the fact, because the scoring pass must integrate only up
         # to H and needs to know the last row runs past the end.
-        elapsed = step_end - start
-        overran = elapsed > duration_seconds
-        print_progress(min(1.0, elapsed / duration_seconds), log[-1], prefix=progress_prefix)
+        overran = t_step_end > duration_seconds
+        print_progress(min(1.0, t_step_end / duration_seconds), log[-1], prefix=progress_prefix)
 
-    if log:
+    if len(log) > 1:
         print()  # close the in-place progress bar
 
     info = {
@@ -391,6 +491,7 @@ def summarize_seed(run: list[dict], duration_seconds: float, info: dict | None =
     `info` is `run_once`'s second return value; when given, its warm-up cost
     and environment interval are carried into `per_seed.csv`.
     """
+    run = queries_only(run)
     regret = np.array([row["regret"] for row in run])
     dt = query_durations(run, duration_seconds)
 
@@ -402,6 +503,10 @@ def summarize_seed(run: list[dict], duration_seconds: float, info: dict | None =
     extra = {} if info is None else {
         "warmup_seconds": info["warmup_seconds"],
         "elapsed_seconds": info["elapsed_seconds"],
+        # Whether the final iteration ran past the deadline. A scorer clips its
+        # integral at H regardless, but this says so without it having to infer
+        # the fact from `wall_time`.
+        "overran": int(info["overran"]),
         "env_speed": info["env_speed"],
         "env_start": info["env_start"],
         "env_end": info["env_end"],
@@ -540,7 +645,8 @@ def save_run(out_dir: Path, runs: list[list[dict]], metadata: dict, duration_sec
     per_seed = [summarize_seed(run, duration_seconds, info)
                 for run, info in zip(runs, infos)]
 
-    write_csv(out_dir / "queries.csv", [row for run in runs for row in run], QUERY_FIELDS)
+    fields = query_fields(spatial_dim_of(runs[0]))
+    write_csv(out_dir / "queries.csv", [row for run in runs for row in run], fields)
     write_csv(out_dir / "per_seed.csv", per_seed)
     write_csv(out_dir / "summary.csv", headline(per_seed))
     (out_dir / "run.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
@@ -551,15 +657,19 @@ def save_run(out_dir: Path, runs: list[list[dict]], metadata: dict, duration_sec
 def load_run(out_dir: Path) -> tuple[list[list[dict]], dict]:
     """Read `queries.csv` + `run.json` back as one list per replication.
 
-    Replications are split on `iteration == 0`, not grouped by `seed`: under
-    `--same-seed` every replication carries the same seed, so grouping by it
-    would silently concatenate all ten into a single run.
+    Replications are split wherever `iteration` stops increasing, not grouped
+    by `seed`: under `--same-seed` every replication carries the same seed, so
+    grouping by it would silently concatenate all ten into a single run. The
+    rule is written this way rather than as `iteration == 0` so that it handles
+    both the current logs (which open each replication with `INITIAL_ROW`, i.e.
+    -1) and older ones (which start at 0).
 
     Logs written before the environment clock landed used `sim_time` and
     `t_response` instead of `env_time` and `t_acq_fit`; they are renamed on the
     way in so the plots still render. Such a run is NOT comparable to a new
-    one -- its environment speed was `(span width) / duration_seconds` -- and
-    it carries none of the split timings, so `plot.py` is as far as it goes.
+    one -- its environment speed was `(span width) / duration_seconds` -- it
+    carries none of the split timings, and it has no `x`, so it cannot be
+    re-scored. `plot.py` is as far as it goes.
     """
     metadata = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
 
@@ -570,11 +680,101 @@ def load_run(out_dir: Path) -> tuple[list[list[dict]], dict]:
         for raw in csv.DictReader(f):
             row = {legacy_names.get(k, k): (int(v) if k in ints else float(v))
                    for k, v in raw.items()}
-            if row["iteration"] == 0:
+            if not runs or row["iteration"] <= runs[-1][-1]["iteration"]:
                 runs.append([])
             runs[-1].append(row)
 
     return runs, metadata
+
+
+def _import_benchmark_module(benchmark_dir: Path, filename: str, alias: str):
+    """Import `<benchmark_dir>/<filename>` under a unique module name.
+
+    Both benchmarks ship a module literally called `objective`, and each
+    `run_experiment.py` reaches it by putting its own directory on `sys.path`.
+    That is fine while a process only ever touches one benchmark -- but a
+    scoring pass that handles both would `import objective` twice and silently
+    get whichever directory came first on the path, scoring one benchmark
+    against the other's objective.
+
+    So load each file explicitly, under `alias`, and register it in
+    `sys.modules` so repeated calls are cheap. `synthetic/objective.py` does
+    `from benchmarks import Benchmark` at import time, so its directory is put
+    on the path first and taken off afterwards.
+    """
+    import importlib.util
+
+    if alias in sys.modules:
+        return sys.modules[alias]
+
+    path_entry = str(benchmark_dir)
+    added = path_entry not in sys.path
+    if added:
+        sys.path.insert(0, path_entry)
+    try:
+        spec = importlib.util.spec_from_file_location(alias, benchmark_dir / filename)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[alias] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if added:
+            sys.path.remove(path_entry)
+
+
+def load_objective(metadata: dict):
+    """Rebuild the exact objective a finished run used, from its `run.json`.
+
+    A scoring pass needs `f(x, t)` and `f*(t)` to re-evaluate the configuration
+    held at arbitrary times, so it has to reconstruct the objective the run was
+    scored against -- at the *same* oracle density and grid resolution, or the
+    numbers will not line up with the run's own `regret` column.
+
+    Everything needed is already in `run.json`; this just spares every caller
+    from reassembling it (and from the `objective` module-name collision).
+    The oracle curve is read from the same cache the run built, so this is
+    cheap for the synthetic benchmark; `temperature` still has to refit its
+    RBF interpolator, which costs ~30-60 s.
+    """
+    here = Path(__file__).resolve().parent
+    args = metadata["args"]
+
+    if metadata["benchmark"] == "temperature":
+        objective = _import_benchmark_module(here / "temperature", "objective.py",
+                                             "wdbo_temperature_objective")
+        density = float(args.get("oracle_density", objective.DEFAULT_ORACLE_DENSITY))
+        cache = metadata.get("oracle_cache") or args.get("oracle_cache")
+        if cache is None:
+            paths = _import_benchmark_module(here / "temperature", "paths.py",
+                                             "wdbo_temperature_paths")
+            cache = paths.DATA_DIR / f"oracle_d{density:g}.npz"
+        return objective.build_objective(
+            Path(args["processed"]),
+            smoothing=float(args["smoothing"]),
+            oracle_density=density,
+            oracle_cache_path=Path(cache),
+        )
+
+    benchmarks = _import_benchmark_module(here / "synthetic", "benchmarks.py",
+                                          "wdbo_synthetic_benchmarks")
+    objective = _import_benchmark_module(here / "synthetic", "objective.py",
+                                         "wdbo_synthetic_objective")
+    benchmark = benchmarks.get_benchmark(metadata["benchmark"])
+    env_span = tuple(args["env_span"]) if args.get("env_span") else benchmark.env_span
+    density = float(args.get("oracle_density", objective.DEFAULT_ORACLE_DENSITY))
+    grid = int(args.get("oracle_grid_resolution", 33))
+    cache = metadata.get("oracle_cache") or args.get("oracle_cache")
+    if cache is None:
+        paths = _import_benchmark_module(here / "synthetic", "paths.py",
+                                         "wdbo_synthetic_paths")
+        cache = paths.DATA_DIR / benchmark.name / objective.oracle_cache_name(env_span, density, grid)
+    return objective.build_objective(
+        benchmark,
+        env_span=env_span,
+        oracle_density=density,
+        oracle_grid_resolution=grid,
+        oracle_cache_path=Path(cache),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -590,7 +790,8 @@ def _resample(runs: list[list[dict]], duration_seconds: float, values) -> tuple[
     """
     grid = np.linspace(0.0, duration_seconds, GRID_POINTS)
     curves = np.stack([
-        np.interp(grid, [row["wall_time"] for row in run], np.asarray(values(run), dtype=float))
+        np.interp(grid, [row["wall_time"] for row in queries_only(run)],
+                  np.asarray(values(queries_only(run)), dtype=float))
         for run in runs
     ])
     return grid, curves
@@ -658,8 +859,8 @@ def save_response_time_plot(runs: list[list[dict]], per_seed: list[dict], path: 
     """
     import matplotlib.pyplot as plt
 
-    response = np.array([row["t_acq_fit"] for run in runs for row in run])
-    regret = np.array([row["regret"] for run in runs for row in run])
+    response = np.array([row["t_acq_fit"] for run in runs for row in queries_only(run)])
+    regret = np.array([row["regret"] for run in runs for row in queries_only(run)])
     seed_response = np.array([row["avg_response_time"] for row in per_seed])
     seed_regret = np.array([row["avg_regret"] for row in per_seed])
 

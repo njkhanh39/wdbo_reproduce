@@ -287,14 +287,22 @@ however many queries it makes, machine-dependent. Columns:
 | `t_acq_fit` | `t_acq + t_fit`, i.e. H.1's response time |
 | `t_eval` | seconds querying `f` — the harness's cost, not the algorithm's |
 | `t_clean` | seconds spent in `clean()` — advances the clock, but not part of `t_acq_fit` |
+| `t_iter_start`, `t_apply`, `t_result`, `t_update_done` | elapsed seconds at each stage. `t_apply` is when `x` took effect — see [`../README.md`](../README.md) §4 |
+| `x_0`, `x_1` | the configuration queried, in the normalized `[0, 1]²` sensor plane |
+| `y` | the noisy reading the algorithm saw |
+| `true_value` | `f(x, env_time)`, noise-free — what regret is measured against |
 | `regret` | **instantaneous** regret of this query |
 | `dataset_size` | model dataset size after cleaning |
 | `n_removed` | how many observations this `clean()` call stripped |
 | `lambda`, `lS`, `lT`, `noise` | the MLE hyperparameters the next iteration will use |
 | `removal_budget` | Algorithm 1's budget `b` after this step |
 
-The 15 initial observations are not in here: they are not queries the
-algorithm chose, so they are excluded from the regret log (see §3).
+The 15 initial observations are not scored: they are not queries the algorithm
+chose (see §3). The **last** of them is logged as a single `iteration = −1`
+row, because it is the configuration in force until the first real query
+applies and a post-hoc scorer needs it to cover the opening stretch. It is
+excluded from every metric and its stage timings are `NaN` — filter on
+`iteration >= 0` before averaging anything yourself.
 
 #### `per_seed.csv` — one row per replication
 

@@ -106,6 +106,7 @@ def main():
         "title": title,
         "noise_std": objective.noise_std,
         "env_schedule": schedule,
+        "oracle_cache": str(oracle_cache),
         "paper_table_2_average_regret": PAPER_TABLE_2_AVERAGE_REGRET,
     })
 

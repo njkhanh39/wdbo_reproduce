@@ -12,7 +12,9 @@ what each knob does, and what a row of the log means. For results, known
 issues and benchmark-specific detail, see
 [`synthetic/README.md`](synthetic/README.md) and
 [`temperature/README.md`](temperature/README.md). For the MI removal rule, see
-[`MI_CRITERION.md`](MI_CRITERION.md).
+[`MI_CRITERION.md`](MI_CRITERION.md). For what recently changed in the harness
+and why — the environment clock, the re-scorable log, and what old results are
+still good for — see [`CHANGES.md`](CHANGES.md).
 
 ---
 
@@ -224,10 +226,42 @@ including while the algorithm is still thinking or waiting for a measurement.
 This is the right headline metric for a system that must run continuously: it
 charges an arm for every second it sat on a stale configuration.
 
-**It is not implemented yet.** Computing it requires re-evaluating
-`f(x_held(t), t)` on a fine time grid after the run, which requires knowing
-which `x` was in force when — and the log does not record `x` yet. That is the
-next change (priority 2/3 of the benchmark note).
+**The scorer is not written yet, but the log now supports it.** Computing it
+means re-evaluating `f(x_held(t), t)` on a fine time grid after the run, which
+needs to know which `x` was in force when. `queries.csv` records exactly that:
+every `x`, and the wall-clock instant it took effect.
+
+The convention: **`x_i` takes effect at `t_apply_i`** — the moment the
+acquisition optimization finishes and `f` is sampled — and holds until
+`t_apply_{i+1}`. While the optimizer is choosing `x_i`, the *previous*
+configuration is still running. The opening stretch `[0, t_apply_0)` is
+covered by the `INITIAL_ROW`. So:
+
+```python
+runs, meta = load_run(results_dir)
+objective = load_objective(meta)          # rebuilds f and f* exactly as the run had them
+sch, H = meta["env_schedule"], meta["args"]["duration_seconds"]
+
+for run in runs:                          # includes the INITIAL_ROW at index 0
+    apply_t = np.array([r["t_apply"] for r in run])
+    points = np.stack([query_point(r) for r in run])
+
+    grid = np.linspace(0.0, H, 4000)      # clipped at H, ignoring any overrun
+    held = np.clip(np.searchsorted(apply_t, grid, side="right") - 1, 0, len(run) - 1)
+    env = sch["env_start"] + sch["env_speed"] * grid
+
+    inst = np.array([objective.oracle(t) - objective.evaluate(points[i], t)
+                     for t, i in zip(env, held)])
+    r_time = np.trapezoid(inst, grid) / H
+```
+
+`load_objective(metadata)` rebuilds the objective at the same oracle density
+and grid resolution the run used, so recomputed regret matches the log's own
+`regret` column exactly. Use it rather than constructing the objective by
+hand: both benchmarks ship a module literally named `objective`, so a scorer
+that handles both and does a plain `import objective` gets whichever directory
+came first on `sys.path` — scoring one benchmark against the other's function.
+`load_objective` loads each under a unique name to make that impossible.
 
 > ### `time_weighted_avg_regret` is deprecated — do not quote it
 >
@@ -308,7 +342,7 @@ Each run writes a timestamped directory under
 | File | Contents |
 |---|---|
 | `queries.csv` | **The raw log, one row per query.** The only irreplaceable artifact. |
-| `per_seed.csv` | One row per replication: the summary stats plus `warmup_seconds`, `elapsed_seconds` and the environment interval covered. |
+| `per_seed.csv` | One row per replication: the summary stats plus `warmup_seconds`, `elapsed_seconds`, `overran` and the environment interval covered. |
 | `summary.csv` | Mean ± standard error across seeds, for the quotable metrics. |
 | `run.json` | Provenance: all arguments, the resolved environment schedule, git commit, host, thread count, library versions. |
 | `*.png` | Regret and dataset size vs. duration; regret vs. response time; an `lT`/removal-budget diagnostic panel (not in the paper). |
@@ -321,27 +355,56 @@ minutes, so change a plot and re-render with
 
 | Column | Meaning |
 |---|---|
-| `seed`, `iteration` | replication id; `iteration` restarts at 0 per replication, which is how `load_run` splits them |
+| `seed`, `iteration` | replication id; `iteration` runs `−1, 0, 1, …` per replication, which is how `load_run` splits them |
 | `env_time` | **absolute environment time** the query was issued at |
-| `wall_time` | real seconds since the loop started, stamped at the *end* of the step |
-| `t_acq`, `t_eval`, `t_fit`, `t_acq_fit`, `t_clean` | the timing split above |
-| `regret` | `f*(env_time) − f(x, env_time)`, noise-free |
+| `wall_time` | real seconds since the loop started, stamped at the *end* of the step (`== t_step_end`) |
+| `t_iter_start` | when the iteration began, i.e. when `env_time` was read |
+| `t_apply` | **when `x` took effect** — acquisition done, `f` being sampled. The timestamp `x_held(t)` is built from |
+| `t_result` | when the reading was in hand |
+| `t_update_done` | when `tell()` returned |
+| `t_acq`, `t_eval`, `t_fit`, `t_acq_fit`, `t_clean` | durations of each stage — the timing split above |
+| `x_0 … x_{d−1}` | the configuration queried, in the benchmark's own units |
+| `y` | the noisy reading the algorithm saw |
+| `true_value` | `f(x, env_time)`, noise-free — what regret is measured against |
+| `regret` | `f*(env_time) − true_value` |
 | `dataset_size`, `n_removed` | after this iteration's `clean()` |
 | `lambda`, `lS`, `lT`, `noise` | MLE hyperparameters as the *next* iteration will see them |
 | `removal_budget` | `(1 + alpha)^(dt / lT)`; `clean()` removes while this exceeds 1 |
 | `min_criterion`, `criterion_lT` | the cheapest observation's score, and the `lT` it was scored under (pre-cleaning, unlike the `lT` column) |
 | `budget_spent` | budget consumed by this iteration's removals |
 
-`x` and `y` are **not** logged yet. They have to be, for the time-averaged
-regret above; that is the next change.
+All timestamps are elapsed seconds from the loop's zero. Map them onto
+environment time with `env_start + env_speed × t`, both of which are in
+`run.json` and `per_seed.csv`.
+
+Regret is computed in the loop as a cheap diagnostic, and against the
+**noise-free** value: crediting an algorithm for a lucky noise draw would be
+wrong. But the loop's convention is frozen at run time, whereas the log can be
+re-scored under any convention — which is the point of logging `x`.
+
+### The `iteration = −1` row
+
+Each replication opens with one `INITIAL_ROW`: the last observation of the
+initial design. It is the configuration in force from wall-clock zero until
+the first real query applies, so a scorer cannot integrate the opening stretch
+without it.
+
+It is **excluded from every metric** (`common.queries_only`) — it is a warm
+start the algorithm was handed, not a point it chose — and its stage timings
+are `NaN`, because it predates the wall clock. If you write your own analysis,
+filter it out before averaging anything.
 
 ### Reading older results
 
-Logs written before the environment clock landed used `sim_time` and
-`t_response`; `load_run` renames them so `plot.py` still works. Such a run is
-**not comparable** to a new one — its environment speed was
-`span / duration_seconds` — and it carries none of the split timings, so
-re-plotting is as far as it goes.
+| Written before | Effect |
+|---|---|
+| the environment clock | `sim_time` / `t_response` are renamed to `env_time` / `t_acq_fit` on load, so `plot.py` works. Environment speed was `span / duration_seconds`, so the numbers are **not comparable** to new ones. |
+| the `x` log | No `x`, `y`, `true_value` or stage timestamps, so the run **cannot be re-scored** — the whole point of the change. Split timings come back `NaN`. |
+
+Both fall out the same way in practice: **old `queries.csv` files still plot,
+but cannot be compared to or re-scored alongside new ones.** Re-run anything
+whose numbers you intend to quote. Do not relabel an old directory and carry
+it forward.
 
 ---
 
@@ -411,14 +474,12 @@ with its default.
 
 Tracked against the benchmark note's priorities:
 
-- **`x` and `y` are not logged.** Without them the run cannot be re-scored
-  after the fact, so the time-averaged regret of §4 cannot be computed. Next
-  change.
+- **No post-hoc scoring pass.** The log now carries everything needed
+  (`x`, `y`, `true_value`, stage timestamps, the `INITIAL_ROW`), but nothing
+  reads it back to compute `(1/H) ∫ [f*(t) − f(x_held(t), t)] dt` yet. Until
+  that lands, the headline number is still `avg_regret`, which ignores time.
 - **`time_weighted_avg_regret` is wrong** and still printed. It goes once the
   real scorer exists.
-- **No post-hoc scoring pass.** Regret is computed inside the hot loop, which
-  means the scoring convention is frozen at run time instead of being a
-  choice you can revisit against a saved log.
 - **Ackley does not move its optimum**, so neither benchmark currently tests
   optimum-tracking, dwelling in a persistently suboptimal region, or abrupt
   regime change.

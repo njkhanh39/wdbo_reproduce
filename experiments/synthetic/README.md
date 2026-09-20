@@ -168,7 +168,11 @@ description; in brief:
   optimization, *excluding* cleaning) along with its `t_acq` / `t_fit` parts
   and `t_eval`, plus `t_clean`, `n_removed`, and the MLE hyperparameters
   `lambda, lS, lT, noise` plus `removal_budget` per query. `env_time` is
-  absolute environment time, not a normalized fraction.
+  absolute environment time, not a normalized fraction. Also the queried point
+  `x_0..x_2`, its reading `y`, the noise-free `true_value`, and the stage
+  timestamps (`t_apply` is when `x` took effect) — these are what let a run be
+  re-scored afterwards. Each replication opens with an `iteration = −1` row
+  holding the initial configuration; it is excluded from every metric.
 - **`per_seed.csv`** — one row per replication: iteration count, both
   average-regret conventions (`time_weighted_avg_regret` is deprecated —
   [`../README.md`](../README.md) §4), mean response and clean time,
