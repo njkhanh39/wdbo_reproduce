@@ -37,17 +37,18 @@ Two scale conventions matter:
   function on the domain `[−32, 32]^d'`" with `d' = 4` and
   `z = (x_1, …, x_d, t)` — so Ackley's time argument runs over `[−32, 32]`,
   like its three spatial arguments. H.1's "the temporal domain [...] is
-  normalized in `[0, 1]`" is a statement about what the **optimizer** sees:
-  `WDBOOptimizer` normalizes space itself and takes a clock in `[0, 1]`
-  (it even passes `0, 1` as the criterion's time-integration bounds), and
-  `objective.py` maps that clock onto the benchmark's `temporal_span`.
+  normalized in `[0, 1]`" describes a convenience of the reference
+  implementation, not the function. The loop here runs on **absolute
+  environment time** — see [`../README.md`](../README.md) §2 — so this span is
+  the axis the experiment really moves along, and its width divided by 600 s
+  is the environment speed the paper's setting implies.
 
-  Each benchmark carries its own `temporal_span` in `benchmarks.py`;
-  `--time-span 0 1` runs the other reading (time literally in `[0, 1]`
+  Each benchmark carries its own `env_span` in `benchmarks.py`;
+  `--env-span 0 1` runs the other reading (time literally in `[0, 1]`
   while space spans `[−32, 32]`, which makes Ackley far smoother in time
-  than in space) as a sensitivity check. Saved results under
-  `results_t-32_32/` use the paper's setting, `results/` and
-  `results_t-4_4/` are variants.
+  than in space) as a sensitivity check. Note it changes the default
+  `--env-speed` too, since that is derived from the span's width. Saved
+  results under `results_t-32_32/` predate the environment clock.
 
   For Ackley the spatial argmin stays at the origin for every `t` under
   either convention (both terms are minimized there), so the "dynamic" part
@@ -68,12 +69,13 @@ No preprocessing and no data download — the objective is analytic.
 
 ```
 benchmarks.py    →  Benchmark: a vectorized f(z), its d spatial box,
-       │              its temporal span, minimize flag
+       │              its env_span, minimize flag
        ▼
-objective.py     →  f(x, t)  (append clock as last axis + sign flip)
-       │              + oracle(t) = max_x (−f(x, t)) via a dense spatial
-       │                grid search, cached to
-       │                data/synthetic/<benchmark>/oracle.npz
+objective.py     →  f(x, t_env)  (append env clock as last axis + sign flip)
+       │              + oracle(t_env) = max_x (−f(x, t_env)) via a dense
+       │                spatial grid search over ABSOLUTE env times, cached
+       │                to data/synthetic/<benchmark>/
+       │                     oracle_t<lo>_<hi>_d<density>_g<grid>.npz
        ▼
 run_experiment.py → runs WDBOOptimizer against the objective,
                      logs regret & dataset size, saves CSVs + plots to
@@ -84,9 +86,9 @@ run_experiment.py → runs WDBOOptimizer against the objective,
 
 `oracle(t)` is built once by `compute_oracle_curve`: a regular
 `grid_resolution ** spatial_dim` spatial grid, evaluated at
-`oracle_time_points` clock values in `[0, 1]` (each mapped onto the
-benchmark's `temporal_span`), taking the max of `−f` at each time;
-the curve is cached and read with `np.interp` in the hot loop. Notes:
+absolute environment times covering `env_span` at `--oracle-density` samples
+per unit of time, taking the max of `−f` at each time; the curve is cached and
+read with `np.interp` in the hot loop. Notes:
 
 - **`--oracle-grid-resolution` (default 33, odd).** Odd so a symmetric-domain
   optimum lands exactly on a node — for Ackley the spatial argmin is the
@@ -94,13 +96,20 @@ the curve is cached and read with `np.interp` in the hot loop. Notes:
   regret for origin queries, no negative regrets over 50k random probes).
   The grid has `33^3 ≈ 3.6·10^4` nodes for `ackley4d`; this is only
   practical while `spatial_dim ≲ 3`.
-- **`--oracle-time-points` (default 4000).** Ackley's `cos(2πz)` term
-  completes one period per unit of time, so over `[−32, 32]` `oracle(t)`
-  oscillates 64× across the horizon (range ≈ `[−20.2, −0.02]`) and needs a
-  few thousand samples before `np.interp` tracks it — 1000 would alias
-  badly. Under `--time-span 0 1` it is a single smooth ripple (range ≈
-  `[−2.16, 0]`) and 1000 is ample. First run spends a few seconds here,
-  then it is cached (per span — see the `_t<lo>_<hi>` filename tag).
+- **`--oracle-density` (default 64, samples *per unit of environment time*).**
+  Ackley's `cos(2πz)` term completes one period per unit of time, so this is
+  ≈64 samples per period; over `[−32, 32]` that is ≈4097 samples for a curve
+  oscillating 64× (range ≈ `[−20.2, −0.02]`). Under `--env-span 0 1` it is a
+  single smooth ripple (range ≈ `[−2.16, 0]`) and far less is ample.
+
+  The density is per *unit*, not per *run*, and that is the whole point: the
+  old `--oracle-time-points` fixed the sample **count** per table, so changing
+  the span silently changed the resolution per unit of time. An under-sampled
+  `f*` misses peaks, which biases it **low**, which makes regret look
+  **better** than it is — and it fails silently. Before trusting a new
+  `--env-speed`, double this and check `f*` does not move. First run spends a
+  few seconds here, then it is cached (per span, density and grid — see the
+  filename tag).
 - **Noise.** `estimate_noise_std` sets `σ` so `Var(noise) = 5 % ·` signal
   variance (paper H.1), estimating the signal variance by sampling `f`
   uniformly over the full `d'` box, time included (deterministic; ≈ 0.38 for
@@ -118,24 +127,28 @@ the compiled `wdbo_criterion` extension; see [`../../NOTE.md`](../../NOTE.md).)
 | flag | default | paper value | notes |
 |---|---|---|---|
 | `--benchmark` | `ackley4d` | — | key in `benchmarks.py` |
-| `--duration-seconds` | 600 | 600 (10 min) | real wall-clock budget per replication |
-| `--n-initial-observations` | 15 | 15 | drawn over `S' × [0, 1/40]`, per H.1 |
-| `--time-span` | benchmark's own | H.2 box (Ackley: `−32 32`) | see §1 |
+| `--duration-seconds` | 600 | 600 (10 min) | real wall-clock budget per replication. Buys compute only — it no longer changes how fast the environment moves |
+| `--n-initial-observations` | 15 | 15 | drawn over `S' ×` the first 1/40 of the reference run's environment interval, per H.1 |
+| `--env-span` | benchmark's own | H.2 box (Ackley: `−32 32`) | the benchmark's whole temporal domain; see §1 |
+| `--env-speed` | `span / 615` | — | environment units per real second. The default makes a 600 s run cover `--env-span` exactly, i.e. the paper's setting. See [`../README.md`](../README.md) §2 |
+| `--env-t0` | low end of span | — | environment time the initial design starts at |
 | `--alpha` | `0.25` | `1/4` | removal-budget hyperparameter. §5.1: "the sweet spot is reached for α = ¼. This hyperparameter value is used to evaluate W-DBO in the next section." |
 | `--n-seeds` | 10 | 10 | independent replications to average |
 | `--seed` / `--same-seed` | 0 / off | — | see [`../temperature/README.md`](../temperature/README.md) §4 |
-| `--oracle-time-points` | 4000 | — | oracle curve resolution (§2) |
+| `--oracle-density` | 64 | — | oracle samples per unit of environment time (§2) |
 | `--oracle-grid-resolution` | 33 | — | oracle spatial grid, per axis (§2) |
 | `--label` | none | — | names the timestamped results directory, e.g. `--label paper` |
 | `--results-dir` | none | — | write here instead of a fresh timestamped directory |
 
 Kernels and the real-time loop are identical to `temperature`: Matérn-5/2
-spatial, Matérn-3/2 temporal, clock `= elapsed / duration_seconds`. Per H.1
-the 15 initial observations are drawn uniformly from `S' × [0, 1/40]` —
-spread across the first fortieth of the horizon, not stacked at `t = 0` —
-and that window is charged against the budget, so the optimization loop
-starts at `t = 1/40`. Initial observations are not queries the algorithm
-chose, so they are excluded from the regret log.
+spatial, Matérn-3/2 temporal, environment clock
+`t_env = env_start + env_speed × elapsed_seconds`. Per H.1 the 15 initial
+observations are drawn uniformly over `S' ×` the first fortieth of the
+reference run's environment interval — spread out, not stacked at one instant
+— and the wall clock starts only once they are in hand, with their real cost
+reported separately as `warmup_seconds` rather than assumed to be `H/40`.
+Initial observations are not queries the algorithm chose, so they are
+excluded from the regret log.
 
 A full `--n-seeds 10 --duration-seconds 600` run is ~100 min of wall time
 (10 × 10 min); use `--n-seeds 1 --duration-seconds 60` for a smoke test.
@@ -143,7 +156,7 @@ A full `--n-seeds 10 --duration-seconds 600` run is ~100 min of wall time
 ## 4. Reading the results
 
 Written to a fresh timestamped directory
-`data/synthetic/<benchmark>/results<span tag>/<YYYYmmdd-HHMMSS>[-label]/` —
+`data/synthetic/<benchmark>/results/<YYYYmmdd-HHMMSS>[-label]/` —
 same files, same meanings, as the temperature experiment, since both share
 [`../common.py`](../common.py). See
 [`../temperature/README.md`](../temperature/README.md) §5–6 for the full
@@ -151,12 +164,16 @@ description; in brief:
 
 - **`queries.csv`** — the raw per-query log, every seed, no resampling. The
   only irreplaceable file; everything else is a view over it. Includes
-  `t_response` (H.1's definition: hyperparameter estimation + acquisition
-  optimization, *excluding* cleaning), `t_clean`, `n_removed`, and the MLE
-  hyperparameters `lambda, lS, lT, noise` plus `removal_budget` per query.
+  `t_acq_fit` (H.1's definition: hyperparameter estimation + acquisition
+  optimization, *excluding* cleaning) along with its `t_acq` / `t_fit` parts
+  and `t_eval`, plus `t_clean`, `n_removed`, and the MLE hyperparameters
+  `lambda, lS, lT, noise` plus `removal_budget` per query. `env_time` is
+  absolute environment time, not a normalized fraction.
 - **`per_seed.csv`** — one row per replication: iteration count, both
-  average-regret conventions, mean response and clean time, final/max/min
-  dataset size, `median_lT`, `total_removed`.
+  average-regret conventions (`time_weighted_avg_regret` is deprecated —
+  [`../README.md`](../README.md) §4), mean response and clean time,
+  final/max/min dataset size, `median_lT`, `total_removed`, plus
+  `warmup_seconds` and the environment interval the run covered.
 - **`summary.csv`** — the quotable numbers as `mean, sem, n_runs`. For
   `ackley4d` the paper's Table 2 reference is average regret ≈ **2.24**; the
   script prints yours next to it.
@@ -180,12 +197,15 @@ description; in brief:
 Re-render any figure from a finished run without repeating it:
 
 ```bash
-python experiments/plot.py data/synthetic/ackley4d/results_t-32_32/<run dir>
+python experiments/plot.py data/synthetic/ackley4d/results/<run dir>
 ```
 
-Runs under `data/synthetic/ackley4d/saved/` predate this layout (and the
-corrections in §1/§3), so `plot.py` cannot read them and their numbers are not
-comparable to new ones.
+Runs under `data/synthetic/ackley4d/saved/` predate this layout entirely, so
+`plot.py` cannot read them. Runs under `results_t-32_32/` predate the
+environment clock: `plot.py` still renders them (`load_run` renames
+`sim_time` → `env_time` and `t_response` → `t_acq_fit`), but their
+environment speed was `span / duration_seconds` and they carry no timing
+split, so their numbers are **not** comparable to new ones.
 
 ## 5. Adding another benchmark
 

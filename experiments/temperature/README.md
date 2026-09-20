@@ -98,7 +98,7 @@ data/temperature/data.txt, data/temperature/mote_locs.txt
         ▼
   objective.py    →  interpolated ground-truth surface f(x, y, t)
         │              + oracle(t) = max_{x,y} f(x, y, t), cached to
-        │                data/temperature/oracle.npz
+        │                data/temperature/oracle_d<density>.npz
         ▼
   run_experiment.py → runs WDBOOptimizer against the objective,
                        logs regret & dataset size, saves plots
@@ -132,26 +132,34 @@ python experiments/temperature/run_experiment.py
 This builds the interpolated objective (`objective.py`, using
 `scipy.interpolate.RBFInterpolator` — a one-off ~30-60s fit, then cheap to
 query) and its oracle curve (a dense space-time grid search, cached to
-`data/temperature/oracle.npz` so it's only computed once), then runs
+`data/temperature/oracle_d<density>.npz` so it's only computed once), then runs
 `WDBOOptimizer` exactly as described in the paper's Appendix H.1:
 
 - Matérn-5/2 spatial kernel, Matérn-3/2 temporal kernel.
 - `alpha = 0.25`. §5.1's sensitivity analysis concludes: "the sweet spot is
   reached for α = ¼. This hyperparameter value is used to evaluate W-DBO in
   the next section" — so every Table 2 number is `α = 1/4`.
-- 15 initial observations drawn uniformly from `S' × [0, 1/40]`, per H.1 —
-  spread over the first fortieth of the horizon rather than stacked at
-  `t = 0`. This matters: 15 observations at a single instant carry no
-  information about the temporal lengthscale `lT`, which the removal budget
-  `(1 + alpha) ** (dt / lT)` divides by. That window is charged against the
-  600 s budget, so the optimization loop starts at `t = 1/40`. Initial
-  observations are not queries the algorithm chose, so they do not appear in
-  the regret log.
-- Each replication runs for a fixed real wall-clock budget (default 600s /
-  10 minutes, matching the paper), during which the optimizer's internal
-  clock sweeps linearly over the day (`current_time = elapsed / duration`).
-  This mirrors `src/test.py`'s own real-time-driven loop, just rescaled to
-  cover a full simulated day instead of a few real minutes.
+- 15 initial observations drawn uniformly over `S' ×` the first fortieth of
+  the reference run's environment interval, per H.1 — spread out rather than
+  stacked at one instant. This matters: 15 observations at a single instant
+  carry no information about the temporal lengthscale `lT`, which the removal
+  budget `(1 + alpha) ** (dt / lT)` divides by. The wall clock starts only
+  once they are in hand; the real seconds they cost are reported separately as
+  `warmup_seconds` rather than assumed to be `H/40`. Initial observations are
+  not queries the algorithm chose, so they do not appear in the regret log.
+- Each replication runs for a fixed real wall-clock budget (`--duration-seconds`,
+  default 600s / 10 minutes, matching the paper) while the **environment
+  clock** advances independently as
+  `t_env = env_start + env_speed × elapsed_seconds`. At the default
+  `--env-speed` a 600 s run plays back exactly the one calendar day the sensor
+  data covers, i.e. the paper's setting; changing the duration then watches
+  *that same day* for more or less time, instead of speeding the day up. See
+  [`../README.md`](../README.md) §2 for why the two clocks are separate.
+
+  The data stops at `t = 1` and `RBFInterpolator` will extrapolate past it
+  silently, so a run longer than 600 s must lower `--env-speed`
+  proportionally. `assert_covers` refuses the run otherwise, before any
+  compute is spent.
 - Observations are corrupted with Gaussian noise at 5% of the signal
   variance, per Appendix H.1.
 
@@ -227,14 +235,16 @@ objective and its cached oracle curve.
   costs something. The paper never says which convention it uses, so both are
   reported; they agree when response times are stable and diverge exactly
   when cleaning stalls.
-- **Response time** (`t_response`): real wall-clock seconds for the two tasks
+- **Response time** (`t_acq_fit`): real wall-clock seconds for the two tasks
   H.1 defines it as — (i) estimating the kernel and noise hyperparameters and
   (ii) optimizing the acquisition function. **Cleaning is not included**, and
   neither is querying the objective (H.1: "the objective function is
   immediately sampled"). Both still advance the wall clock — Algorithm 1
   reads the clock *after* the removal loop — they just aren't part of the
-  metric. `t_clean` is logged separately; it is frequently comparable to
-  `t_response` in size, so conflating them overstates response time badly.
+  metric. `t_clean` and `t_eval` are logged separately; `t_clean` is
+  frequently comparable to `t_acq_fit` in size, so conflating them overstates
+  response time badly. The two halves are logged separately too, as `t_acq`
+  and `t_fit`, so a slow arm can be blamed on the right stage.
 - **Dataset size**: how many points W-DBO's internal model currently holds,
   after stale ones are cleaned out. Floored at 2 (the cleaning loop stops at
   `xx_tt.shape[0] > 2`).
@@ -270,10 +280,13 @@ however many queries it makes, machine-dependent. Columns:
 | column | meaning |
 |---|---|
 | `seed`, `iteration` | which replication, and the query's index within it |
-| `sim_time` | the optimizer's normalized clock, `elapsed / duration` ∈ `[1/40, 1]` |
+| `env_time` | **absolute environment time** the query was issued at, in the objective's own units |
 | `wall_time` | elapsed real seconds at the end of the step |
-| `t_response` | H.1's response time: hyperparameter estimation + acquisition optimization |
-| `t_clean` | seconds spent in `clean()` — advances the clock, but not part of `t_response` |
+| `t_acq` | seconds optimizing the acquisition function — H.1's (ii) |
+| `t_fit` | seconds in `tell()`: conditioning the GP and re-estimating hyperparameters — H.1's (i) |
+| `t_acq_fit` | `t_acq + t_fit`, i.e. H.1's response time |
+| `t_eval` | seconds querying `f` — the harness's cost, not the algorithm's |
+| `t_clean` | seconds spent in `clean()` — advances the clock, but not part of `t_acq_fit` |
 | `regret` | **instantaneous** regret of this query |
 | `dataset_size` | model dataset size after cleaning |
 | `n_removed` | how many observations this `clean()` call stripped |
@@ -285,8 +298,9 @@ algorithm chose, so they are excluded from the regret log (see §3).
 
 #### `per_seed.csv` — one row per replication
 
-`iterations`, both average-regret conventions, mean `t_response` and
-`t_clean`, final/max/min dataset size, `median_lT`, and `total_removed`. This
+`iterations`, both average-regret conventions, mean `t_acq_fit` and
+`t_clean`, final/max/min dataset size, `median_lT`, `total_removed`, plus
+`warmup_seconds` and the environment interval the run covered. This
 is the file that shows "8 seeds fine, 2 stuck at 2" at a glance, and
 `iterations` is the check on whether your machine is doing comparable work to
 the paper's (an i9-9980HK, 8 cores / 16 threads).
@@ -327,7 +341,7 @@ behind it. See §6.
 
 #### `regret_vs_response_time.png` (1 panel)
 
-Every query's `(t_response, instantaneous regret)` scattered across all
+Every query's `(t_acq_fit, instantaneous regret)` scattered across all
 seeds, plus **one orange marker per seed** at that seed's own average and a
 black X at the mean of those. Mirrors Figure 20 (left) — the paper overlays one
 box per baseline algorithm; running W-DBO alone, the per-seed markers are what
@@ -410,7 +424,8 @@ them — they have no `queries.csv` and no `run.json`.
 
 - **Matches**: the benchmark's definition (3D spatio-temporal, first day of
   data, activate-the-hottest-point task), the kernel choices, the 15 initial
-  observations over `S' × [0, 1/40]`, `alpha = 1/4`, the 600 s wall-clock
+  observations over `S' ×` the first 1/40 of the environment interval,
+  `alpha = 1/4`, the 600 s wall-clock
   budget, and the noise model — all taken directly from Appendix H.1/H.2 of
   the paper.
 - **Approximates**: the exact 46-sensor subset (we use a documented,

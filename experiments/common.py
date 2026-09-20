@@ -6,8 +6,27 @@ the summary statistics, the run metadata and the plots all live here, so the
 two benchmarks cannot drift apart.
 
 An objective, for our purposes, is anything exposing `spatial_domain`,
-`noise_std`, `evaluate(x, t)` and `oracle(t)` -- see either benchmark's
-`objective.py`.
+`noise_std`, `evaluate(x, t_env)` and `oracle(t_env)` -- see either
+benchmark's `objective.py`.
+
+Two clocks
+----------
+The loop keeps two separate clocks, and keeping them separate is the point:
+
+* the **wall clock**, in real seconds, measured with `time.perf_counter()`.
+  It starts at 0 when the optimization loop proper begins and runs to
+  `duration_seconds` (`H`). This is the compute budget.
+* the **environment clock** `t_env`, in the objective's own time units. It
+  advances as `t_env = env_start + env_speed * elapsed_seconds`, where
+  `env_speed` is a free parameter in environment-units per real second.
+  This is how fast the world moves.
+
+Earlier revisions collapsed the two into `elapsed / duration_seconds`, which
+tied them together: shortening a run from 600 s to 200 s did not just cut the
+compute budget, it also made the environment drift three times faster, so the
+600 s and 200 s arms were not the same problem at different budgets -- they
+were different problems. `env_speed` breaks that: change `H` to change the
+budget, change `env_speed` to change the difficulty, never both at once.
 
 Design note: `run_once` writes a *raw* log, one row per real query. It is the
 only irreplaceable artifact a run produces; `per_seed.csv`, `summary.csv` and
@@ -33,8 +52,17 @@ import torch
 from wdbo_algo.mi_optimizer import MIDBOOptimizer
 from wdbo_algo.optimizer import WDBOOptimizer
 
-# Paper H.1: the initial observations are sampled uniformly in S' x [0, 1/40].
+# Paper H.1: the initial observations are sampled uniformly in S' x [0, 1/40]
+# of the environment interval the run is about to cover. Gathered at a single
+# instant they would carry no information about the temporal lengthscale lT.
 INITIAL_TIME_FRACTION = 1.0 / 40.0
+
+# The paper's wall-clock budget, and the one every arm in this repo is tuned
+# around. It is no longer what sets the environment speed -- it is only the
+# duration `default_env_speed` calibrates that speed against, so that a default
+# 600 s run reproduces the paper's setting and a 200 s run is the *same*
+# environment observed for less time.
+REFERENCE_DURATION = 600.0
 
 # Which removal criterion an arm uses. "none" is the ablation: clean() is never
 # called, so the dataset grows monotonically.
@@ -46,27 +74,90 @@ CRITERIA = ("wasserstein", "mi", "none")
 GRID_POINTS = 200
 
 QUERY_FIELDS = [
-    "seed", "iteration", "sim_time", "wall_time",
-    "t_response", "t_clean", "regret", "dataset_size", "n_removed",
+    "seed", "iteration", "env_time", "wall_time",
+    "t_acq", "t_eval", "t_fit", "t_acq_fit", "t_clean",
+    "regret", "dataset_size", "n_removed",
     "lambda", "lS", "lT", "noise", "removal_budget",
     "min_criterion", "criterion_lT", "budget_spent",
 ]
 
 
 # --------------------------------------------------------------------------
+# The environment clock
+# --------------------------------------------------------------------------
+
+def default_env_speed(env_span: tuple[float, float],
+                      reference_duration: float = REFERENCE_DURATION) -> float:
+    """Environment units per real second, calibrated so a 600 s run fills `env_span`.
+
+    The paper runs every benchmark for 600 s over the whole of its temporal
+    domain, so that is the speed we default to. Solving
+
+        warmup_span + env_speed * H == span_width   with H = reference_duration
+        warmup_span == INITIAL_TIME_FRACTION * env_speed * H
+
+    for `env_speed` gives the expression below. The `(1 + 1/40)` accounts for
+    the initial-design window, which occupies environment time ahead of the
+    run: without it a default run would need slightly more environment than
+    the benchmark defines, and on `temperature` -- where the data simply stops
+    at `t = 1` -- that would mean extrapolating an RBF fit past its support.
+
+    Every other duration then observes *this* environment for longer or
+    shorter, which is the comparison section 4 of the benchmark note asks for.
+    """
+    lo, hi = env_span
+    return (float(hi) - float(lo)) / (reference_duration * (1.0 + INITIAL_TIME_FRACTION))
+
+
+def env_schedule(env_t0: float, env_speed: float, duration_seconds: float,
+                 reference_duration: float = REFERENCE_DURATION) -> dict:
+    """Resolve the environment times a run will touch, before it starts.
+
+    Returns `warmup_span` (the environment interval the initial design is drawn
+    over), `env_start` (the environment time the wall clock's zero corresponds
+    to, i.e. no earlier than the last initial observation) and `env_end` (the
+    environment time at `elapsed == duration_seconds`).
+
+    `warmup_span` is deliberately sized against `reference_duration` rather
+    than against this run's `duration_seconds`: it is H.1's fortieth of the
+    *paper's* horizon, in environment units, and so depends only on
+    `env_speed`. That makes `env_start` the same for every duration at a given
+    speed, which in turn makes a 200 s run an exact prefix of a 600 s run --
+    the same environment, watched for less time. Scaling it with
+    `duration_seconds` would have reintroduced, in miniature, the coupling
+    this whole change exists to remove.
+
+    Callers use `env_end` twice: to check the objective can actually be
+    evaluated that far, and as the MI criterion's `clip_horizon`.
+    """
+    warmup_span = INITIAL_TIME_FRACTION * env_speed * reference_duration
+    env_start = env_t0 + warmup_span
+    return {
+        "env_t0": float(env_t0),
+        "env_speed": float(env_speed),
+        "warmup_span": float(warmup_span),
+        "env_start": float(env_start),
+        "env_end": float(env_start + env_speed * duration_seconds),
+    }
+
+
+# --------------------------------------------------------------------------
 # The optimization loop
 # --------------------------------------------------------------------------
 
-def print_progress(current_time: float, row: dict, prefix: str = "", bar_width: int = 30):
-    """Render a one-line, in-place progress bar for the current replication."""
-    filled = int(bar_width * current_time)
+def print_progress(fraction: float, row: dict, prefix: str = "", bar_width: int = 30):
+    """Render a one-line, in-place progress bar for the current replication.
+
+    `fraction` is progress through the *wall-clock* budget, `elapsed / H` -- no
+    longer the environment clock, which now has units of its own.
+    """
+    filled = int(bar_width * fraction)
     bar = "#" * filled + "-" * (bar_width - filled)
-    end = "\n" if current_time >= 1.0 else ""
     print(
-        f"\r{prefix}[{bar}] {current_time * 100:5.1f}%"
-        f" | size={row['dataset_size']:4d} | resp={row['t_response']:5.2f}s"
+        f"\r{prefix}[{bar}] {fraction * 100:5.1f}%"
+        f" | size={row['dataset_size']:4d} | resp={row['t_acq_fit']:5.2f}s"
         f" | clean={row['t_clean']:5.2f}s | lT={row['lT']:.3g}",
-        end=end, flush=True,
+        end="", flush=True,
     )
 
 
@@ -100,10 +191,10 @@ def build_optimizer(objective, n_initial_observations: int, alpha: float, criter
 
 
 def run_once(objective, duration_seconds: float, n_initial_observations: int, alpha: float,
-             seed: int, progress_prefix: str = "", removal: bool = True,
-             criterion: str = "wasserstein", min_dataset_size: int = 15,
-             mi_options: dict | None = None) -> list[dict]:
-    """Run a single replication and return its raw per-query log.
+             seed: int, env_t0: float, env_speed: float, progress_prefix: str = "",
+             removal: bool = True, criterion: str = "wasserstein", min_dataset_size: int = 15,
+             mi_options: dict | None = None) -> tuple[list[dict], dict]:
+    """Run a single replication; return its raw per-query log and its run info.
 
     `criterion` selects the removal rule: "wasserstein" is W-DBO's own, "mi" is
     the mutual-information criterion, and "none" is the ablation in which
@@ -111,6 +202,19 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
     same kernels, same acquisition, same clock, only removal disabled. Under
     "none", `n_removed` and `removal_budget` are trivially 0 and 1.0, and
     `t_clean` is ~0. `removal=False` is kept as an alias for it.
+
+    `env_t0` and `env_speed` fix the environment clock (see the module
+    docstring): the initial design is drawn over
+    `[env_t0, env_t0 + warmup_span]`, the wall clock starts at zero once that
+    design is in hand, and query `i` is issued at
+    `env_start + env_speed * elapsed_i`. Nothing about the environment depends
+    on `duration_seconds` any more, so two durations at one `env_speed` are the
+    same world watched for different lengths of time.
+
+    The returned info dict carries what the log cannot: how long the initial
+    design really took (charged to nobody -- it is *not* part of `H`), the
+    environment interval actually covered, and whether the last iteration
+    overran the deadline.
 
     Note the no-removal arm cannot be compared to the others at a fixed
     iteration count: the dataset grows without bound, GP inference is O(n^3), so
@@ -125,48 +229,68 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+    schedule = env_schedule(env_t0, env_speed, duration_seconds)
+    env_start = schedule["env_start"]
+
     optimizer = build_optimizer(objective, n_initial_observations, alpha, criterion,
                                 min_dataset_size, mi_options, seed)
 
-    # Paper H.1: the initial observations are sampled uniformly in S' x [0, 1/40],
-    # i.e. spread over the first fortieth of the horizon -- not all at t = 0.
-    # Gathered at a single instant they carry no information about the temporal
-    # lengthscale lT, which the removal budget (1 + alpha) ** (dt / lT) divides by.
-    for t0 in np.sort(rng.uniform(0.0, INITIAL_TIME_FRACTION, n_initial_observations)):
-        x = optimizer.next_query(t0)
-        optimizer.tell(x, t0, objective.evaluate(x, t0) + rng.normal(0.0, objective.noise_std))
+    # Paper H.1: the initial observations are sampled uniformly in S' x [0, 1/40]
+    # of the run's environment interval -- spread out, not all at one instant, so
+    # they say something about the temporal lengthscale lT, which the removal
+    # budget (1 + alpha) ** (dt / lT) divides by.
+    #
+    # This is a warm start handed to the algorithm, not part of the contest: the
+    # real seconds it costs are measured and reported separately rather than
+    # back-dated into the budget the way earlier revisions did (which silently
+    # assumed the warm-up took exactly H/40 seconds, whatever it really took).
+    warmup_mark = time.perf_counter()
+    warmup_times = env_t0 + np.sort(
+        rng.uniform(0.0, schedule["warmup_span"], n_initial_observations))
+    for t_env in warmup_times:
+        x = optimizer.next_query(t_env)
+        optimizer.tell(x, t_env, objective.evaluate(x, t_env) + rng.normal(0.0, objective.noise_std))
+    warmup_seconds = time.perf_counter() - warmup_mark
 
     log: list[dict] = []
-    # That initial window is charged against the experiment budget: back-date the
-    # clock so the loop starts at t = 1/40 and advances continuously from there.
-    start = time.time() - duration_seconds * INITIAL_TIME_FRACTION
-    current_time = INITIAL_TIME_FRACTION
+    start = time.perf_counter()
+    overran = False
 
-    while current_time < 1.0:
+    while True:
+        # Check the deadline BEFORE committing to a query: a query started with
+        # no budget left would be scored on an environment the run is not
+        # supposed to reach. `H` is a hard stop, not a target to overshoot.
+        elapsed = time.perf_counter() - start
+        if elapsed >= duration_seconds:
+            break
+        t_env = env_start + env_speed * elapsed
+
         # (ii) optimize the acquisition function.
-        mark = time.time()
-        x = optimizer.next_query(current_time)
-        t_acqf = time.time() - mark
+        mark = time.perf_counter()
+        x = optimizer.next_query(t_env)
+        t_acq = time.perf_counter() - mark
 
         # H.1: "the objective function is immediately sampled" -- querying f is
         # the experiment harness's cost, not the algorithm's, so it is timed out
         # of the response time (it still advances the wall clock).
-        true_value = objective.evaluate(x, current_time)
+        mark = time.perf_counter()
+        true_value = objective.evaluate(x, t_env)
         y = true_value + rng.normal(0.0, objective.noise_std)
+        t_eval = time.perf_counter() - mark
 
         # (i) condition the GP and re-estimate the kernel and noise parameters.
-        mark = time.time()
-        optimizer.tell(x, current_time, y)
-        t_fit = time.time() - mark
+        mark = time.perf_counter()
+        optimizer.tell(x, t_env, y)
+        t_fit = time.perf_counter() - mark
 
         # Removing stale observations advances the wall clock (Algorithm 1 reads
         # the clock after the removal loop) but is NOT part of the response time:
         # H.1 defines that as the sum of (i) and (ii) only.
         size_before = optimizer.dataset_size()
-        mark = time.time()
+        mark = time.perf_counter()
         if criterion != "none":
-            optimizer.clean(current_time)
-        step_end = time.time()
+            optimizer.clean(t_env)
+        step_end = time.perf_counter()
 
         # The MLE hyperparameters and removal budget as the next iteration will
         # see them. Read off private attributes: `wdbo_algo` is vendored in this
@@ -175,11 +299,16 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         log.append({
             "seed": seed,
             "iteration": len(log),
-            "sim_time": current_time,
+            "env_time": t_env,
             "wall_time": step_end - start,
-            "t_response": t_acqf + t_fit,
+            # H.1's response time is (i) + (ii) only; the parts are logged
+            # separately so a slow arm can be blamed on the right stage.
+            "t_acq": t_acq,
+            "t_eval": t_eval,
+            "t_fit": t_fit,
+            "t_acq_fit": t_acq + t_fit,
             "t_clean": step_end - mark,
-            "regret": objective.oracle(current_time) - true_value,
+            "regret": objective.oracle(t_env) - true_value,
             "dataset_size": optimizer.dataset_size(),
             "n_removed": size_before - optimizer.dataset_size(),
             "lambda": optimizer._lambda,
@@ -197,10 +326,25 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
             "budget_spent": optimizer._budget_spent,
         })
 
-        current_time = min(1.0, (step_end - start) / duration_seconds)
-        print_progress(current_time, log[-1], prefix=progress_prefix)
+        # An iteration that started inside the budget may finish outside it. We
+        # let it finish -- killing a half-conditioned GP would corrupt the run --
+        # but record the fact, because the scoring pass must integrate only up
+        # to H and needs to know the last row runs past the end.
+        elapsed = step_end - start
+        overran = elapsed > duration_seconds
+        print_progress(min(1.0, elapsed / duration_seconds), log[-1], prefix=progress_prefix)
 
-    return log
+    if log:
+        print()  # close the in-place progress bar
+
+    info = {
+        "seed": seed,
+        "warmup_seconds": warmup_seconds,
+        "elapsed_seconds": time.perf_counter() - start,
+        "overran": overran,
+        **schedule,
+    }
+    return log, info
 
 
 # --------------------------------------------------------------------------
@@ -208,23 +352,44 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
 # --------------------------------------------------------------------------
 
 def query_durations(run: list[dict], duration_seconds: float) -> np.ndarray:
-    """How long each query's regret stood before the next query replaced it.
+    """How long each iteration took, from the previous iteration's end to this one's.
 
-    The first query is charged from the end of the initial-observation window.
+    DEPRECATED, and note this is *not* how long query `i` was the configuration
+    in force: `wall_time` is stamped at the end of the step, so `dt[i]` spans
+    the interval ending when `x_i` has just been cleaned up after -- most of
+    which `x_i` did not yet exist for. The interval `x_i` actually stood is
+    `[t_query_i, t_query_{i+1})`. Kept only to keep `time_weighted_avg_regret`
+    reproducible while the post-hoc scorer (priority 3) is written against the
+    richer log; delete both once that lands.
     """
     wall = np.array([row["wall_time"] for row in run])
-    return np.diff(wall, prepend=duration_seconds * INITIAL_TIME_FRACTION)
+    return np.diff(wall, prepend=0.0)
 
 
-def summarize_seed(run: list[dict], duration_seconds: float) -> dict:
+def _mean_of(run: list[dict], key: str) -> float:
+    """Mean of `key` over the run, or NaN if a legacy log never recorded it."""
+    values = [row[key] for row in run if key in row]
+    return float(np.mean(values)) if values else float("nan")
+
+
+def summarize_seed(run: list[dict], duration_seconds: float, info: dict | None = None) -> dict:
     """One row of per-replication diagnostics.
 
     Two regret conventions are reported, because the paper does not say which
-    it uses. `avg_regret` is the plain mean over queries. `time_weighted` is
-    sum(r_i dt_i) / sum(dt_i), the discrete form of (1/T) integral of r(t) dt:
-    it charges each query for as long as it actually stood, which is what makes
-    a slow iteration cost something. They agree when response times are stable
-    and diverge exactly when cleaning stalls.
+    it uses. `avg_regret` is the plain mean over queries.
+
+    `time_weighted_avg_regret` is sum(r_i dt_i) / sum(dt_i). It is DEPRECATED
+    and should not be quoted: it multiplies a regret measured at one instant by
+    a duration, which assumes regret holds still while a configuration is in
+    force. In a dynamic problem it does not -- both `f*(t)` and `f(x_i, t)`
+    drift, and drifting apart is exactly what makes a stale configuration bad.
+    It is also misaligned by one step (see `query_durations`) and normalized by
+    sum(dt) rather than by `H`. The correct quantity is
+    `(1/H) * integral of (f*(t) - f(x_held(t), t)) dt`, which has to be
+    recomputed after the run from the logged query points -- priority 3.
+
+    `info` is `run_once`'s second return value; when given, its warm-up cost
+    and environment interval are carried into `per_seed.csv`.
     """
     regret = np.array([row["regret"] for row in run])
     dt = query_durations(run, duration_seconds)
@@ -234,12 +399,24 @@ def summarize_seed(run: list[dict], duration_seconds: float) -> dict:
     min_criterion = np.array([row.get("min_criterion", np.nan) for row in run], dtype=float)
     median_min_criterion = float(np.nanmedian(min_criterion)) if np.any(np.isfinite(min_criterion)) else float("nan")
 
+    extra = {} if info is None else {
+        "warmup_seconds": info["warmup_seconds"],
+        "elapsed_seconds": info["elapsed_seconds"],
+        "env_speed": info["env_speed"],
+        "env_start": info["env_start"],
+        "env_end": info["env_end"],
+    }
+
     return {
         "seed": run[0]["seed"],
         "iterations": len(run),
         "avg_regret": float(regret.mean()),
         "time_weighted_avg_regret": float((regret * dt).sum() / dt.sum()),
-        "avg_response_time": float(np.mean([row["t_response"] for row in run])),
+        "avg_response_time": float(np.mean([row["t_acq_fit"] for row in run])),
+        # NaN on a legacy log, which only recorded the (i) + (ii) total.
+        "avg_acq_time": _mean_of(run, "t_acq"),
+        "avg_fit_time": _mean_of(run, "t_fit"),
+        "avg_eval_time": _mean_of(run, "t_eval"),
         "avg_clean_time": float(np.mean([row["t_clean"] for row in run])),
         "final_dataset_size": run[-1]["dataset_size"],
         "max_dataset_size": max(row["dataset_size"] for row in run),
@@ -247,11 +424,14 @@ def summarize_seed(run: list[dict], duration_seconds: float) -> dict:
         "median_lT": float(np.median([row["lT"] for row in run])),
         "median_min_criterion": median_min_criterion,
         "total_removed": sum(row["n_removed"] for row in run),
+        **extra,
     }
 
 
 HEADLINE_METRICS = [
     ("average_regret", "avg_regret"),
+    # Deprecated; see `summarize_seed`. Still printed so a run can be compared
+    # against the numbers already recorded in logs/ and the old READMEs.
     ("time_weighted_average_regret", "time_weighted_avg_regret"),
     ("response_time_s", "avg_response_time"),
     ("clean_time_s", "avg_clean_time"),
@@ -348,10 +528,17 @@ def write_csv(path: Path, rows: list[dict], fieldnames: list[str] | None = None)
         writer.writerows(rows)
 
 
-def save_run(out_dir: Path, runs: list[list[dict]], metadata: dict, duration_seconds: float) -> list[dict]:
-    """Write the raw log, the per-seed table, the headline table and run.json."""
+def save_run(out_dir: Path, runs: list[list[dict]], metadata: dict, duration_seconds: float,
+             infos: list[dict] | None = None) -> list[dict]:
+    """Write the raw log, the per-seed table, the headline table and run.json.
+
+    `infos` is the list of `run_once` info dicts, one per replication; passing
+    it adds the warm-up cost and the environment interval to `per_seed.csv`.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
-    per_seed = [summarize_seed(run, duration_seconds) for run in runs]
+    infos = infos or [None] * len(runs)
+    per_seed = [summarize_seed(run, duration_seconds, info)
+                for run, info in zip(runs, infos)]
 
     write_csv(out_dir / "queries.csv", [row for run in runs for row in run], QUERY_FIELDS)
     write_csv(out_dir / "per_seed.csv", per_seed)
@@ -367,14 +554,22 @@ def load_run(out_dir: Path) -> tuple[list[list[dict]], dict]:
     Replications are split on `iteration == 0`, not grouped by `seed`: under
     `--same-seed` every replication carries the same seed, so grouping by it
     would silently concatenate all ten into a single run.
+
+    Logs written before the environment clock landed used `sim_time` and
+    `t_response` instead of `env_time` and `t_acq_fit`; they are renamed on the
+    way in so the plots still render. Such a run is NOT comparable to a new
+    one -- its environment speed was `(span width) / duration_seconds` -- and
+    it carries none of the split timings, so `plot.py` is as far as it goes.
     """
     metadata = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
 
+    legacy_names = {"sim_time": "env_time", "t_response": "t_acq_fit"}
     ints = {"seed", "iteration", "dataset_size", "n_removed"}
     runs: list[list[dict]] = []
     with open(out_dir / "queries.csv", newline="") as f:
         for raw in csv.DictReader(f):
-            row = {k: (int(v) if k in ints else float(v)) for k, v in raw.items()}
+            row = {legacy_names.get(k, k): (int(v) if k in ints else float(v))
+                   for k, v in raw.items()}
             if row["iteration"] == 0:
                 runs.append([])
             runs[-1].append(row)
@@ -463,7 +658,7 @@ def save_response_time_plot(runs: list[list[dict]], per_seed: list[dict], path: 
     """
     import matplotlib.pyplot as plt
 
-    response = np.array([row["t_response"] for run in runs for row in run])
+    response = np.array([row["t_acq_fit"] for run in runs for row in run])
     regret = np.array([row["regret"] for run in runs for row in run])
     seed_response = np.array([row["avg_response_time"] for row in per_seed])
     seed_regret = np.array([row["avg_regret"] for row in per_seed])
@@ -564,16 +759,23 @@ def add_criterion_arguments(parser):
                              "(one Gumbel fit per future time instead of n), but conditions f*_t on the "
                              "observation being scored.")
     parser.add_argument("--mi-clip-horizon", action="store_true",
-                        help="Cap the criterion's future horizon at the end of the run (t = 1) instead of "
-                             "letting it run as far as the model's own lengthscale reaches.")
+                        help="Cap the criterion's future horizon at the environment time the run ends at, "
+                             "instead of letting it run as far as the model's own lengthscale reaches.")
     parser.add_argument("--no-removal", action="store_true",
                         help="Alias for --criterion none. Compare against a removal arm at the same "
                              "--duration-seconds, never at the same iteration count.")
     return parser
 
 
-def criterion_settings(args) -> tuple[str, float, dict, str]:
+def criterion_settings(args, env_end: float) -> tuple[str, float, dict, str]:
     """Resolve the removal-rule flags into what `run_once` and the run label need.
+
+    `env_end` is the environment time the run finishes at -- `env_schedule`'s
+    `env_end`. It is what `--mi-clip-horizon` caps the criterion's lookahead
+    at. This used to be hard-coded to 1.0, which was only ever right while the
+    optimizer's clock was the normalized `[0, 1]` one; on an absolute
+    environment clock a hard-coded 1.0 would silently clip the horizon to
+    nothing (Ackley starts at t = -32) and quietly disable the flag.
 
     Returns:
         (criterion, alpha, mi_options, variant) -- `variant` is the human-readable
@@ -594,7 +796,7 @@ def criterion_settings(args) -> tuple[str, float, dict, str]:
         n_candidates=args.mi_candidates,
         weight=args.mi_weight,
         fstar_source="full" if args.mi_fstar_full else "loo",
-        clip_horizon=1.0 if args.mi_clip_horizon else None,
+        clip_horizon=env_end if args.mi_clip_horizon else None,
     )
     fstar_note = "" if mi_options["fstar_source"] == "loo" else ", f* from full D"
     return criterion, args.mi_alpha, mi_options, f"mi, alpha={args.mi_alpha:g} nats{fstar_note}"
