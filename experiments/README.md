@@ -226,65 +226,9 @@ including while the algorithm is still thinking or waiting for a measurement.
 This is the right headline metric for a system that must run continuously: it
 charges an arm for every second it sat on a stale configuration.
 
-**The scorer is not written yet, but the log now supports it.** Computing it
-means re-evaluating `f(x_held(t), t)` on a fine time grid after the run, which
-needs to know which `x` was in force when. `queries.csv` records exactly that:
-every `x`, and the wall-clock instant it took effect.
+`experiments/scoring.py` computes this after the run from the logged configurations and application times. It evaluates the noise-free objective and oracle on a common wall-clock grid, inserts every configuration change as an integration boundary, and clips the integral at `H`. `time_avg_regret` in `per_seed.csv` and `time_average_regret` in `summary.csv` are the primary scores. Query regret is retained separately as `avg_regret` and `query_average_regret`.
 
-The convention: **`x_i` takes effect at `t_apply_i`** — the moment the
-acquisition optimization finishes and `f` is sampled — and holds until
-`t_apply_{i+1}`. While the optimizer is choosing `x_i`, the *previous*
-configuration is still running. The opening stretch `[0, t_apply_0)` is
-covered by the `INITIAL_ROW`. So:
-
-```python
-runs, meta = load_run(results_dir)
-objective = load_objective(meta)          # rebuilds f and f* exactly as the run had them
-sch, H = meta["env_schedule"], meta["args"]["duration_seconds"]
-
-for run in runs:                          # includes the INITIAL_ROW at index 0
-    apply_t = np.array([r["t_apply"] for r in run])
-    points = np.stack([query_point(r) for r in run])
-
-    grid = np.linspace(0.0, H, 4000)      # clipped at H, ignoring any overrun
-    held = np.clip(np.searchsorted(apply_t, grid, side="right") - 1, 0, len(run) - 1)
-    env = sch["env_start"] + sch["env_speed"] * grid
-
-    inst = np.array([objective.oracle(t) - objective.evaluate(points[i], t)
-                     for t, i in zip(env, held)])
-    r_time = np.trapezoid(inst, grid) / H
-```
-
-`load_objective(metadata)` rebuilds the objective at the same oracle density
-and grid resolution the run used, so recomputed regret matches the log's own
-`regret` column exactly. Use it rather than constructing the objective by
-hand: both benchmarks ship a module literally named `objective`, so a scorer
-that handles both and does a plain `import objective` gets whichever directory
-came first on `sys.path` — scoring one benchmark against the other's function.
-`load_objective` loads each under a unique name to make that impossible.
-
-> ### `time_weighted_avg_regret` is deprecated — do not quote it
->
-> The column still in `summary.csv` computes `Σ rᵢ·Δtᵢ / Σ Δtᵢ`. It is wrong
-> in three separate ways, kept only so the new code stays comparable to the
-> numbers already recorded in `logs/` while the real scorer is written.
->
-> 1. **It multiplies a snapshot by a duration.** `rᵢ = f*(tᵢ) − f(xᵢ, tᵢ)` is
->    measured at one instant. Multiplying by `Δtᵢ` assumes regret holds still
->    while `xᵢ` is in force. In a dynamic problem it does not: *both* `f*(t)`
->    and `f(xᵢ, t)` drift, and they drift **apart** — a fixed point gets left
->    behind as the surface slides under it. That growth is precisely what
->    makes a stale configuration bad, and this metric is blind to it.
-> 2. **It is misaligned by one step.** `wall_time` is stamped at the *end* of
->    the step, so `Δtᵢ` spans the interval ending after `xᵢ` has already been
->    cleaned up after — most of which `xᵢ` did not yet exist for. The interval
->    `xᵢ` actually stood is `[t_queryᵢ, t_queryᵢ₊₁)`. The practical damage:
->    a slow `clean()` after query `i` inflates `Δtᵢ₊₁`, so it penalizes
->    `xᵢ₊₁` instead of `xᵢ`, which is the point that actually had to wait.
-> 3. **It is normalized by `Σ Δt`, not by `H`.** The stretch after the last
->    query is never counted, so arms making different numbers of queries are
->    normalized over slightly different horizons.
-
+`python experiments/plot.py RESULTS_DIR` rebuilds the objective from `run.json`, then recomputes the tables and figures. Logs without coordinates or application events are rejected and must be rerun. The oracle remains an approximation from a spatial search grid and cached time curve; refine those grids before interpreting small differences between methods.
 ### Speed
 
 `t_acq_fit` is Appendix H.1's response time: acquisition optimization (ii)
@@ -474,17 +418,9 @@ with its default.
 
 Tracked against the benchmark note's priorities:
 
-- **No post-hoc scoring pass.** The log now carries everything needed
-  (`x`, `y`, `true_value`, stage timestamps, the `INITIAL_ROW`), but nothing
-  reads it back to compute `(1/H) ∫ [f*(t) − f(x_held(t), t)] dt` yet. Until
-  that lands, the headline number is still `avg_regret`, which ignores time.
-- **`time_weighted_avg_regret` is wrong** and still printed. It goes once the
-  real scorer exists.
 - **Ackley does not move its optimum**, so neither benchmark currently tests
   optimum-tracking, dwelling in a persistently suboptimal region, or abrupt
   regime change.
-- **Correctness tests are not written.** The three the note calls for:
-  `f(x, t) = −(x − t)²` with `x` held at 0 should give time-averaged regret
-  → 1/3; a static function with an optimal configuration should give 0 regret
-  however long you stall; and the `none` arm must log and score correctly
-  despite never calling `clean()`.
+- **Numerical validation:** the analytic scorer tests and short WSL GP smoke
+  runs pass. A full 600-second, multi-seed experiment and oracle-resolution
+  sensitivity study are still needed before reporting method comparisons.

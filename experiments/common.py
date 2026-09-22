@@ -35,13 +35,8 @@ by `plot.py` without re-running the experiment (which costs 10 minutes per
 seed).
 
 The log records the queried point `x`, its reading `y`, the noise-free
-`true_value`, and the wall-clock instant each stage of the iteration happened
-at. That is what makes a run *re-scorable*: the headline metric for a live
-system is the time-average of `f*(t) - f(x_held(t), t)`, where `x_held(t)` is
-the configuration actually in force, and no amount of post-processing can
-recover that from regret snapshots alone. Regret is computed in the loop too,
-but only as a cheap diagnostic; the authoritative number comes from a scoring
-pass over this log.
+`true_value`, and the wall-clock instant each stage happened. Oracle calls and
+all regret calculations happen after the timed loop.
 """
 from __future__ import annotations
 
@@ -61,6 +56,7 @@ import torch
 
 from wdbo_algo.mi_optimizer import MIDBOOptimizer
 from wdbo_algo.optimizer import WDBOOptimizer
+from scoring import score_run
 
 # Paper H.1: the initial observations are sampled uniformly in S' x [0, 1/40]
 # of the environment interval the run is about to cover. Gathered at a single
@@ -78,9 +74,8 @@ REFERENCE_DURATION = 600.0
 # called, so the dataset grows monotonically.
 CRITERIA = ("wasserstein", "mi", "none")
 
-# Resolution of the common wall-clock grid the per-seed curves are averaged on.
-# A plotting concern only: seeds make different numbers of queries at different
-# wall times, so they have to be resampled onto a shared grid before averaging.
+# Resolution of the common wall-clock grid for per-seed curves. The scorer
+# adds configuration changes and oracle-table knots for the integral itself.
 GRID_POINTS = 200
 
 # The row index of the pseudo-query describing the configuration the run
@@ -328,7 +323,7 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         **{f"x_{i}": float(v) for i, v in enumerate(np.ravel(x))},
         "y": y,
         "true_value": true_value,
-        "regret": objective.oracle(float(warmup_times[-1])) - true_value,
+        "regret": float("nan"),
         "dataset_size": optimizer.dataset_size(),
         "n_removed": 0,
         "lambda": optimizer._lambda,
@@ -351,13 +346,17 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         t_iter_start = time.perf_counter() - start
         if t_iter_start >= duration_seconds:
             break
-        t_env = env_start + env_speed * t_iter_start
-
         # (ii) optimize the acquisition function. The previous configuration is
         # still the one in force throughout this: x_i does not exist yet.
-        x = optimizer.next_query(t_env)
+        x = optimizer.next_query(env_start + env_speed * t_iter_start)
         t_apply = time.perf_counter() - start
         t_acq = t_apply - t_iter_start
+        # Acquisition may itself consume the remaining budget. No measurement
+        # is issued outside the scored horizon or the objective's support.
+        if t_apply >= duration_seconds:
+            overran = True
+            break
+        t_env = env_start + env_speed * t_apply
 
         # H.1: "the objective function is immediately sampled" -- querying f is
         # the experiment harness's cost, not the algorithm's, so it is timed out
@@ -380,8 +379,8 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         # the clock after the removal loop) but is NOT part of the response time:
         # H.1 defines that as the sum of (i) and (ii) only.
         size_before = optimizer.dataset_size()
-        if criterion != "none":
-            optimizer.clean(t_env)
+        if criterion != "none" and t_update_done < duration_seconds:
+            optimizer.clean(env_start + env_speed * t_update_done)
         step_end = time.perf_counter()
         t_step_end = step_end - start
 
@@ -409,7 +408,7 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
             **{f"x_{i}": float(v) for i, v in enumerate(np.ravel(x))},
             "y": y,
             "true_value": true_value,
-            "regret": objective.oracle(t_env) - true_value,
+            "regret": float("nan"),
             "dataset_size": optimizer.dataset_size(),
             "n_removed": size_before - optimizer.dataset_size(),
             "lambda": optimizer._lambda,
@@ -451,49 +450,25 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
 # Summary statistics
 # --------------------------------------------------------------------------
 
-def query_durations(run: list[dict], duration_seconds: float) -> np.ndarray:
-    """How long each iteration took, from the previous iteration's end to this one's.
-
-    DEPRECATED, and note this is *not* how long query `i` was the configuration
-    in force: `wall_time` is stamped at the end of the step, so `dt[i]` spans
-    the interval ending when `x_i` has just been cleaned up after -- most of
-    which `x_i` did not yet exist for. The interval `x_i` actually stood is
-    `[t_query_i, t_query_{i+1})`. Kept only to keep `time_weighted_avg_regret`
-    reproducible while the post-hoc scorer (priority 3) is written against the
-    richer log; delete both once that lands.
-    """
-    wall = np.array([row["wall_time"] for row in run])
-    return np.diff(wall, prepend=0.0)
-
-
 def _mean_of(run: list[dict], key: str) -> float:
     """Mean of `key` over the run, or NaN if a legacy log never recorded it."""
     values = [row[key] for row in run if key in row]
     return float(np.mean(values)) if values else float("nan")
 
 
-def summarize_seed(run: list[dict], duration_seconds: float, info: dict | None = None) -> dict:
+def summarize_seed(run: list[dict], score: dict,
+                   info: dict | None = None) -> dict:
     """One row of per-replication diagnostics.
 
-    Two regret conventions are reported, because the paper does not say which
-    it uses. `avg_regret` is the plain mean over queries.
-
-    `time_weighted_avg_regret` is sum(r_i dt_i) / sum(dt_i). It is DEPRECATED
-    and should not be quoted: it multiplies a regret measured at one instant by
-    a duration, which assumes regret holds still while a configuration is in
-    force. In a dynamic problem it does not -- both `f*(t)` and `f(x_i, t)`
-    drift, and drifting apart is exactly what makes a stale configuration bad.
-    It is also misaligned by one step (see `query_durations`) and normalized by
-    sum(dt) rather than by `H`. The correct quantity is
-    `(1/H) * integral of (f*(t) - f(x_held(t), t)) dt`, which has to be
-    recomputed after the run from the logged query points -- priority 3.
+    `time_avg_regret` integrates the held configuration over the full horizon.
+    `avg_regret` is the separate plain mean at measurement instants.
 
     `info` is `run_once`'s second return value; when given, its warm-up cost
     and environment interval are carried into `per_seed.csv`.
     """
+    initial = run[0]
     run = queries_only(run)
     regret = np.array([row["regret"] for row in run])
-    dt = query_durations(run, duration_seconds)
 
     # NaN on every query of the no-removal arm, which never runs a cleaning loop,
     # and on any query whose loop broke before scoring anything.
@@ -513,20 +488,20 @@ def summarize_seed(run: list[dict], duration_seconds: float, info: dict | None =
     }
 
     return {
-        "seed": run[0]["seed"],
+        "seed": initial["seed"],
         "iterations": len(run),
-        "avg_regret": float(regret.mean()),
-        "time_weighted_avg_regret": float((regret * dt).sum() / dt.sum()),
-        "avg_response_time": float(np.mean([row["t_acq_fit"] for row in run])),
+        "time_avg_regret": score["time_avg_regret"],
+        "avg_regret": float(regret.mean()) if len(run) else float("nan"),
+        "avg_response_time": _mean_of(run, "t_acq_fit"),
         # NaN on a legacy log, which only recorded the (i) + (ii) total.
         "avg_acq_time": _mean_of(run, "t_acq"),
         "avg_fit_time": _mean_of(run, "t_fit"),
         "avg_eval_time": _mean_of(run, "t_eval"),
-        "avg_clean_time": float(np.mean([row["t_clean"] for row in run])),
-        "final_dataset_size": run[-1]["dataset_size"],
-        "max_dataset_size": max(row["dataset_size"] for row in run),
-        "min_dataset_size": min(row["dataset_size"] for row in run),
-        "median_lT": float(np.median([row["lT"] for row in run])),
+        "avg_clean_time": _mean_of(run, "t_clean"),
+        "final_dataset_size": (run[-1] if run else initial)["dataset_size"],
+        "max_dataset_size": max(row["dataset_size"] for row in [initial, *run]),
+        "min_dataset_size": min(row["dataset_size"] for row in [initial, *run]),
+        "median_lT": float(np.median([row["lT"] for row in run])) if run else float("nan"),
         "median_min_criterion": median_min_criterion,
         "total_removed": sum(row["n_removed"] for row in run),
         **extra,
@@ -534,10 +509,8 @@ def summarize_seed(run: list[dict], duration_seconds: float, info: dict | None =
 
 
 HEADLINE_METRICS = [
-    ("average_regret", "avg_regret"),
-    # Deprecated; see `summarize_seed`. Still printed so a run can be compared
-    # against the numbers already recorded in logs/ and the old READMEs.
-    ("time_weighted_average_regret", "time_weighted_avg_regret"),
+    ("time_average_regret", "time_avg_regret"),
+    ("query_average_regret", "avg_regret"),
     ("response_time_s", "avg_response_time"),
     ("clean_time_s", "avg_clean_time"),
     ("iterations", "iterations"),
@@ -551,12 +524,13 @@ def headline(per_seed: list[dict]) -> list[dict]:
     confidence intervals overlap the best one's, so the SEM is what makes a
     reproduction comparable to it.
     """
-    n = len(per_seed)
     rows = []
     for name, key in HEADLINE_METRICS:
         values = np.array([row[key] for row in per_seed], dtype=float)
-        sem = float(values.std(ddof=1) / np.sqrt(n)) if n > 1 else 0.0
-        rows.append({"metric": name, "mean": float(values.mean()), "sem": sem, "n_runs": n})
+        finite = values[np.isfinite(values)]
+        sem = float(finite.std(ddof=1) / np.sqrt(len(finite))) if len(finite) > 1 else 0.0
+        rows.append({"metric": name, "mean": float(finite.mean()) if len(finite) else float("nan"),
+                     "sem": sem, "n_runs": len(finite)})
     return rows
 
 
@@ -633,17 +607,32 @@ def write_csv(path: Path, rows: list[dict], fieldnames: list[str] | None = None)
         writer.writerows(rows)
 
 
+def score_results(runs: list[list[dict]], metadata: dict, objective,
+                  duration_seconds: float, infos: list[dict] | None = None):
+    """Produce per-seed scores and curves from raw logs and the run clock."""
+    infos = infos or [None] * len(runs)
+    if len(infos) != len(runs):
+        raise ValueError("One run-info record is required per run")
+    schedule = metadata.get("env_schedule")
+    if not schedule:
+        raise ValueError("Missing environment schedule; old logs must be rerun")
+    scores = [score_run(run, objective, duration_seconds,
+                        float(schedule["env_start"]), float(schedule["env_speed"]),
+                        grid_points=GRID_POINTS)
+              for run in runs]
+    return [summarize_seed(run, score, info)
+            for run, score, info in zip(runs, scores, infos)], scores
+
+
 def save_run(out_dir: Path, runs: list[list[dict]], metadata: dict, duration_seconds: float,
-             infos: list[dict] | None = None) -> list[dict]:
+             objective, infos: list[dict] | None = None) -> tuple[list[dict], list[dict]]:
     """Write the raw log, the per-seed table, the headline table and run.json.
 
     `infos` is the list of `run_once` info dicts, one per replication; passing
     it adds the warm-up cost and the environment interval to `per_seed.csv`.
     """
+    per_seed, scores = score_results(runs, metadata, objective, duration_seconds, infos)
     out_dir.mkdir(parents=True, exist_ok=True)
-    infos = infos or [None] * len(runs)
-    per_seed = [summarize_seed(run, duration_seconds, info)
-                for run, info in zip(runs, infos)]
 
     fields = query_fields(spatial_dim_of(runs[0]))
     write_csv(out_dir / "queries.csv", [row for run in runs for row in run], fields)
@@ -651,7 +640,7 @@ def save_run(out_dir: Path, runs: list[list[dict]], metadata: dict, duration_sec
     write_csv(out_dir / "summary.csv", headline(per_seed))
     (out_dir / "run.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
-    return per_seed
+    return per_seed, scores
 
 
 def load_run(out_dir: Path) -> tuple[list[list[dict]], dict]:
@@ -664,21 +653,20 @@ def load_run(out_dir: Path) -> tuple[list[list[dict]], dict]:
     both the current logs (which open each replication with `INITIAL_ROW`, i.e.
     -1) and older ones (which start at 0).
 
-    Logs written before the environment clock landed used `sim_time` and
-    `t_response` instead of `env_time` and `t_acq_fit`; they are renamed on the
-    way in so the plots still render. Such a run is NOT comparable to a new
-    one -- its environment speed was `(span width) / duration_seconds` -- it
-    carries none of the split timings, and it has no `x`, so it cannot be
-    re-scored. `plot.py` is as far as it goes.
+    Older logs lacking x or application events cannot be scored and must be
+    rerun. Their old summary and plots must not be relabeled as time regret.
     """
     metadata = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
 
-    legacy_names = {"sim_time": "env_time", "t_response": "t_acq_fit"}
     ints = {"seed", "iteration", "dataset_size", "n_removed"}
     runs: list[list[dict]] = []
     with open(out_dir / "queries.csv", newline="") as f:
-        for raw in csv.DictReader(f):
-            row = {legacy_names.get(k, k): (int(v) if k in ints else float(v))
+        reader = csv.DictReader(f)
+        fields = set(reader.fieldnames or [])
+        if not {"t_apply", "env_time", "x_0"}.issubset(fields):
+            raise ValueError(f"{out_dir}: log lacks x or application times; rerun the experiment")
+        for raw in reader:
+            row = {k: (int(v) if k in ints else float(v))
                    for k, v in raw.items()}
             if not runs or row["iteration"] <= runs[-1][-1]["iteration"]:
                 runs.append([])
@@ -726,9 +714,8 @@ def load_objective(metadata: dict):
     """Rebuild the exact objective a finished run used, from its `run.json`.
 
     A scoring pass needs `f(x, t)` and `f*(t)` to re-evaluate the configuration
-    held at arbitrary times, so it has to reconstruct the objective the run was
-    scored against -- at the *same* oracle density and grid resolution, or the
-    numbers will not line up with the run's own `regret` column.
+    held at arbitrary times, so it reconstructs the objective with the same
+    oracle density and grid resolution recorded for the run.
 
     Everything needed is already in `run.json`; this just spares every caller
     from reassembling it (and from the `objective` module-name collision).
@@ -782,25 +769,16 @@ def load_objective(metadata: dict):
 # --------------------------------------------------------------------------
 
 def _resample(runs: list[list[dict]], duration_seconds: float, values) -> tuple[np.ndarray, np.ndarray]:
-    """Each seed's `values(run)` piecewise-linearly resampled onto a shared grid.
-
-    Seeds make different numbers of queries at different wall times, so they
-    cannot be averaged pointwise without this. Values past a seed's last query
-    are held flat.
-    """
+    """Resample logged state, held until the next completed iteration."""
     grid = np.linspace(0.0, duration_seconds, GRID_POINTS)
-    curves = np.stack([
-        np.interp(grid, [row["wall_time"] for row in queries_only(run)],
-                  np.asarray(values(queries_only(run)), dtype=float))
-        for run in runs
-    ])
+    curves = []
+    for run in runs:
+        times = np.asarray([row["wall_time"] for row in run], dtype=float)
+        state = np.asarray(values(run), dtype=float)
+        indices = np.clip(np.searchsorted(times, grid, side="right") - 1, 0, len(run) - 1)
+        curves.append(state[indices])
+    curves = np.stack(curves)
     return grid, curves
-
-
-def _running_average(values) -> np.ndarray:
-    """Cumulative mean: element i is the average of values[0..i]."""
-    values = np.asarray(values, dtype=float)
-    return np.cumsum(values) / np.arange(1, len(values) + 1)
 
 
 def _seed_lines(ax, grid, curves, log=False, legend=True):
@@ -824,22 +802,18 @@ def _seed_lines(ax, grid, curves, log=False, legend=True):
         ax.legend(fontsize=8)
 
 
-def save_duration_plot(runs: list[list[dict]], duration_seconds: float, path: Path, title: str = ""):
-    """Average regret up to t, and dataset size, against elapsed duration.
-
-    Mirrors the paper's per-benchmark right-hand figure. The regret panel plots
-    the *running* average: each seed's cumulative mean regret is computed first,
-    then resampled onto the shared grid. Both panels show the across-seed mean
-    with the individual seeds faint behind it -- see `_seed_lines`.
-    """
+def save_duration_plot(runs: list[list[dict]], scores: list[dict], duration_seconds: float,
+                       path: Path, title: str = ""):
+    """Plot the integrated time regret and dataset size against elapsed time."""
     import matplotlib.pyplot as plt
 
-    grid, regret = _resample(runs, duration_seconds, lambda run: _running_average([r["regret"] for r in run]))
+    grid = scores[0]["grid"]
+    regret = np.stack([score["running_time_regret"] for score in scores])
     _, size = _resample(runs, duration_seconds, lambda run: [r["dataset_size"] for r in run])
 
     fig, (regret_ax, size_ax) = plt.subplots(1, 2, figsize=(10, 4))
     _seed_lines(regret_ax, grid, regret)
-    regret_ax.set(xlabel="Duration (s)", ylabel="Average regret up to t", title="Regret")
+    regret_ax.set(xlabel="Duration (s)", ylabel="Time-average regret up to t", title="Held-configuration regret")
     _seed_lines(size_ax, grid, size, log=True)
     size_ax.set(xlabel="Duration (s)", ylabel="Dataset size", title="Dataset size")
     if title:
@@ -858,21 +832,28 @@ def save_response_time_plot(runs: list[list[dict]], per_seed: list[dict], path: 
     query, mark each seed's own average, and put the mean of those on top.
     """
     import matplotlib.pyplot as plt
+    import textwrap
 
     response = np.array([row["t_acq_fit"] for run in runs for row in queries_only(run)])
     regret = np.array([row["regret"] for run in runs for row in queries_only(run)])
-    seed_response = np.array([row["avg_response_time"] for row in per_seed])
-    seed_regret = np.array([row["avg_regret"] for row in per_seed])
+    valid = [row for row in per_seed if row["iterations"] > 0]
+    seed_response = np.array([row["avg_response_time"] for row in valid])
+    seed_regret = np.array([row["avg_regret"] for row in valid])
 
     fig, ax = plt.subplots(figsize=(5, 4))
-    ax.scatter(response, regret, s=10, alpha=0.2, color="tab:blue", label="Individual queries")
-    ax.scatter(seed_response, seed_regret, s=45, color="tab:orange", edgecolor="black",
-               linewidth=0.5, zorder=3, label="Per-seed average")
-    ax.plot(seed_response.mean(), seed_regret.mean(), "X", color="black",
-            markersize=12, zorder=4, label="Mean across seeds")
-    ax.set_xscale("log")
-    ax.set(xlabel="Response time (s)", ylabel="Regret", title=title or "Regret vs. response time")
-    ax.legend()
+    if len(response):
+        ax.scatter(response, regret, s=10, alpha=0.2, color="tab:blue", label="Individual queries")
+        ax.scatter(seed_response, seed_regret, s=45, color="tab:orange", edgecolor="black",
+                   linewidth=0.5, zorder=3, label="Per-seed average")
+        ax.plot(seed_response.mean(), seed_regret.mean(), "X", color="black",
+                markersize=12, zorder=4, label="Mean across seeds")
+        ax.set_xscale("log")
+        ax.legend()
+    else:
+        ax.text(0.5, 0.5, "No queries within this run", ha="center", va="center",
+                transform=ax.transAxes)
+    ax.set(xlabel="Acquisition + fit time (s)", ylabel="Query regret")
+    ax.set_title(textwrap.fill(title or "Query regret vs. response time", width=42), fontsize=9)
 
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -912,9 +893,9 @@ def save_diagnostics_plot(runs: list[list[dict]], duration_seconds: float, path:
 
 
 def save_plots(out_dir: Path, runs: list[list[dict]], per_seed: list[dict],
-               duration_seconds: float, title: str = ""):
+               scores: list[dict], duration_seconds: float, title: str = ""):
     """Render every plot for a results directory. Also the entry point for plot.py."""
-    save_duration_plot(runs, duration_seconds, out_dir / "regret_and_size_vs_duration.png", title)
+    save_duration_plot(runs, scores, duration_seconds, out_dir / "regret_and_size_vs_duration.png", title)
     save_response_time_plot(runs, per_seed, out_dir / "regret_vs_response_time.png", title)
     save_diagnostics_plot(runs, duration_seconds, out_dir / "lengthscale_and_budget.png", title)
 
@@ -1007,6 +988,6 @@ def print_headline(rows: list[dict], reference: float | None = None):
     """Print the quotable numbers, next to the paper's Table 2 value if known."""
     for row in rows:
         line = f"  {row['metric']:<32} {row['mean']:10.4f} +/- {row['sem']:.4f} (n={row['n_runs']})"
-        if reference is not None and row["metric"] == "average_regret":
-            line += f"   [paper Table 2: {reference:.2f}]"
+        if reference is not None and row["metric"] == "query_average_regret" and row["n_runs"]:
+            line += f"   [paper Table 2: {reference:.2f}; convention may differ]"
         print(line)

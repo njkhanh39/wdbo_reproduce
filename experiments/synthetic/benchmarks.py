@@ -27,7 +27,8 @@ environment speed too, since that is derived from the span.)
 
 So a benchmark here is a vectorized function, its ``d`` spatial box, the range
 its time axis spans, and whether it is minimized. `objective.py` turns one into
-the ``f(x, t)`` / ``oracle(t)`` pair the experiment loop needs;
+the ``f(x, t)`` evaluator for the experiment loop and the ``oracle(t)``
+table used by post-run scoring;
 `run_experiment.py` selects one with ``--benchmark``.
 """
 from __future__ import annotations

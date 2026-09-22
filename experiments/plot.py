@@ -9,9 +9,10 @@ Usage:
     python experiments/plot.py data/temperature/results/*/        # several at once
 """
 import argparse
+import csv
 from pathlib import Path
 
-from common import load_run, save_plots, summarize_seed
+from common import headline, load_objective, load_run, save_plots, score_results, write_csv
 
 
 def main():
@@ -23,9 +24,21 @@ def main():
     for out_dir in args.results_dir:
         runs, metadata = load_run(out_dir)
         duration = float(metadata["args"]["duration_seconds"])
-        per_seed = [summarize_seed(run, duration) for run in runs]
-        save_plots(out_dir, runs, per_seed, duration, args.title or metadata.get("title", ""))
-        print(f"Re-rendered plots in {out_dir} ({len(runs)} seed(s), {duration:g}s)")
+        objective = load_objective(metadata)
+        per_seed, scores = score_results(runs, metadata, objective, duration)
+        old_table = out_dir / "per_seed.csv"
+        if old_table.exists():
+            with old_table.open(newline="") as stream:
+                old_rows = list(csv.DictReader(stream))
+            if len(old_rows) == len(per_seed):
+                provenance = ("warmup_seconds", "elapsed_seconds", "overran",
+                              "env_speed", "env_start", "env_end")
+                per_seed = [{**new, **{key: old[key] for key in provenance if key in old}}
+                            for old, new in zip(old_rows, per_seed)]
+        write_csv(out_dir / "per_seed.csv", per_seed)
+        write_csv(out_dir / "summary.csv", headline(per_seed))
+        save_plots(out_dir, runs, per_seed, scores, duration, args.title or metadata.get("title", ""))
+        print(f"Re-scored tables and plots in {out_dir} ({len(runs)} seed(s), {duration:g}s)")
 
 
 if __name__ == "__main__":

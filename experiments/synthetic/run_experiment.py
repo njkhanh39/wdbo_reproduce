@@ -132,8 +132,8 @@ def main():
         "paper_table_2_average_regret": PAPER_TABLE_2.get(benchmark.name),
     })
 
-    per_seed = common.save_run(out_dir, runs, metadata, args.duration_seconds, infos)
-    common.save_plots(out_dir, runs, per_seed, args.duration_seconds, title)
+    per_seed, scores = common.save_run(out_dir, runs, metadata, args.duration_seconds, objective, infos)
+    common.save_plots(out_dir, runs, per_seed, scores, args.duration_seconds, title)
 
     print(f"\n{title}")
     common.print_headline(common.headline(per_seed), reference=PAPER_TABLE_2.get(benchmark.name))

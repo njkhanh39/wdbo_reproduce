@@ -221,20 +221,8 @@ objective and its cached oracle curve.
   W-DBO picks a point `x` at time `t`, instantaneous regret = `best(t) -
   f(x, t)` (best possible value at that instant, minus what we actually
   got). One value per query.
-- **Average (running) regret up to `t`**: the *cumulative mean* of every
-  instantaneous regret from all queries made so far, up to time `t`. This is
-  the `R_t / t` convention: it keeps averaging in more queries as `t` grows,
-  so it smooths out and typically trends toward a stable value. **This is
-  the paper's convention and the one to compare against Figure 20.**
-- **Time-weighted average regret up to `t`**: the same idea, but each query
-  is weighted by how long it actually stood before the next one replaced it —
-  `sum(r_i · dt_i) / sum(dt_i)`, the discrete form of `(1/t)∫r dt`. The
-  unweighted mean counts a query that stood for 3 s the same as one that
-  stood for 0.3 s, whereas §5's protocol ("two iterations of a solution are
-  separated by its response time") exists precisely so that being slow
-  costs something. The paper never says which convention it uses, so both are
-  reported; they agree when response times are stable and diverge exactly
-  when cleaning stalls.
+- **Query-average regret** (`avg_regret`): mean noise-free regret at the query measurement instants. It describes the selected points, but omits idle intervals. The paper does not state enough detail to assume its Table 2 uses exactly this convention.
+- **Time-average regret** (`time_avg_regret`): the post-run integral of `f*(t) - f(x_held(t), t)` over the full wall-clock horizon, divided by `H`. The scorer re-evaluates the held configuration at a common time grid and splits at every application event. This is the primary system metric.
 - **Response time** (`t_acq_fit`): real wall-clock seconds for the two tasks
   H.1 defines it as — (i) estimating the kernel and noise hyperparameters and
   (ii) optimizing the acquisition function. **Cleaning is not included**, and
@@ -306,7 +294,7 @@ excluded from every metric and its stage timings are `NaN` — filter on
 
 #### `per_seed.csv` — one row per replication
 
-`iterations`, both average-regret conventions, mean `t_acq_fit` and
+`iterations`, `time_avg_regret`, `avg_regret`, mean `t_acq_fit` and
 `t_clean`, final/max/min dataset size, `median_lT`, `total_removed`, plus
 `warmup_seconds` and the environment interval the run covered. This
 is the file that shows "8 seeds fine, 2 stuck at 2" at a glance, and
@@ -315,7 +303,7 @@ the paper's (an i9-9980HK, 8 cores / 16 threads).
 
 #### `summary.csv` — the headline numbers
 
-`metric, mean, sem, n_runs` for average regret, time-weighted average regret,
+`metric, mean, sem, n_runs` for time-average regret, query-average regret,
 response time, clean time and iteration count. **Standard error, not
 variance**: Table 2 underlines algorithms whose confidence intervals overlap
 the best one's, so the SEM is what makes the comparison. The paper's W-DBO
@@ -334,16 +322,12 @@ thread count fixed across runs you intend to compare.
 
 #### `regret_and_size_vs_duration.png` (2 panels)
 
-Each seed's **running (cumulative) average** regret is computed first, *then*
-resampled onto a shared 200-point `linspace(0, duration, 200)` wall-clock
-grid (`np.interp`; values past a seed's last query are held flat), *then*
-*then* summarised across seeds. That grid is a plotting internal — it is no
-longer written to disk.
+Each seed's cumulative time-regret integral is divided by elapsed time on a common wall-clock grid. Application events are inserted as integration boundaries; the final integral ends at the run horizon.
 
 Both panels draw the **across-seed mean**, with every seed as a faint line
 behind it. See §6.
 
-- **Left — Regret**: average regret up to `t`. Mirrors Figure 20 (right),
+- **Left — Regret**: time-average regret up to `t`. This is a different convention from Figure 20 (right),
   regret side.
 - **Right — Dataset size**: log y-axis. See §6 for how to read the band.
 

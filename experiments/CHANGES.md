@@ -1,5 +1,9 @@
 # Changes: the environment clock and the re-scorable log
 
+**Current status:** Priority 3 is implemented in `scoring.py` and the shared
+reporting path. The historical notes below describe the state after priorities
+1 and 2; references to the scorer as "still missing" refer to that revision.
+
 What was changed in the experiment harness to address **priorities 1 and 2** of
 §5 of the benchmark note (`Benchmark_DBO.pdf`, 19/09/2026), why, and what it
 unlocks. For the experiment design itself see [`README.md`](README.md).
@@ -143,8 +147,8 @@ end time. The `QUERY_FIELDS` constant became `query_fields(spatial_dim)`.
 `queries.csv` straight into pandas and calling `.mean()` gives wrong numbers
 with no error. Filter on `iteration >= 0`.
 
-**Environment.** These experiments only run under the WSL venv
-(`~/wdbo_venv`); the compiled `wdbo_criterion` extension fails to load on the
+**Environment.** These experiments run under the WSL venv
+(`~/.venvs/wdbo_reproduce`); the compiled `wdbo_criterion` extension fails to load on the
 Windows conda environment. Unrelated to these changes — see
 [`../NOTE.md`](../NOTE.md).
 

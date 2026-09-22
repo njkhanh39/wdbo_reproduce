@@ -173,9 +173,8 @@ description; in brief:
   timestamps (`t_apply` is when `x` took effect) — these are what let a run be
   re-scored afterwards. Each replication opens with an `iteration = −1` row
   holding the initial configuration; it is excluded from every metric.
-- **`per_seed.csv`** — one row per replication: iteration count, both
-  average-regret conventions (`time_weighted_avg_regret` is deprecated —
-  [`../README.md`](../README.md) §4), mean response and clean time,
+- **`per_seed.csv`** — one row per replication: iteration count, integrated
+  `time_avg_regret` and separate query mean `avg_regret`, mean response and clean time,
   final/max/min dataset size, `median_lT`, `total_removed`, plus
   `warmup_seconds` and the environment interval the run covered.
 - **`summary.csv`** — the quotable numbers as `mean, sem, n_runs`. For
@@ -184,9 +183,9 @@ description; in brief:
 - **`run.json`** — args, git commit, host, CPU, torch thread count, versions.
   The benchmark is wall-clock-driven, so the machine is an experimental
   parameter and two runs are only comparable if this matches.
-- **`regret_and_size_vs_duration.png`** — left: **average regret up to t**
-  (each seed's running cumulative mean, resampled onto a shared 200-point
-  grid); right: dataset size on a log axis. Both panels draw the across-seed
+- **`regret_and_size_vs_duration.png`** — left: **time-average regret up to t**
+  (integrated from the configuration held on each interval, including changes
+  between grid points); right: dataset size on a log axis. Both panels draw the across-seed
   mean with every seed faint behind it — seed outcomes can be bimodal, so the
   individual lines matter (temperature README §6).
 - **`regret_vs_response_time.png`** — every query scattered, plus the
