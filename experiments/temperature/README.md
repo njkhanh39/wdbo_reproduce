@@ -98,7 +98,7 @@ data/temperature/data.txt, data/temperature/mote_locs.txt
         ▼
   objective.py    →  interpolated ground-truth surface f(x, y, t)
         │              + oracle(t) = max_{x,y} f(x, y, t), cached to
-        │                data/temperature/oracle_d<density>.npz
+        │                data/temperature/oracle_d<density>_g<grid>_s<smoothing>.npz
         ▼
   run_experiment.py → runs WDBOOptimizer against the objective,
                        logs regret & dataset size, saves plots
@@ -132,7 +132,8 @@ python experiments/temperature/run_experiment.py
 This builds the interpolated objective (`objective.py`, using
 `scipy.interpolate.RBFInterpolator` — a one-off ~30-60s fit, then cheap to
 query) and its oracle curve (a dense space-time grid search, cached to
-`data/temperature/oracle_d<density>.npz` so it's only computed once), then runs
+`data/temperature/oracle_d<density>_g<grid>_s<smoothing>.npz` so it's only
+computed once), then runs
 `WDBOOptimizer` exactly as described in the paper's Appendix H.1:
 
 - Matérn-5/2 spatial kernel, Matérn-3/2 temporal kernel.

@@ -49,6 +49,33 @@ have no `x`), so the name cannot be misread.
 
 ---
 
+## Temperature oracle cache keyed by smoothing and grid
+
+The temperature cache was named `oracle_d<density>.npz`, but the table also
+depends on `--smoothing` (which changes the RBF surface itself), the spatial
+grid resolution, and the contents of `processed.npz`. A run with a non-default
+`--smoothing` would have evaluated `f` on the new surface while reading `f*`
+from a table built on the old one: wrong regret, no error.
+
+Now:
+
+- the file is `oracle_d<density>_g<grid>_s<smoothing>.npz`;
+- it stores those settings plus a SHA-256 of the fitted point cloud, and
+  `build_objective` refuses a cache whose stored values disagree with the
+  requested ones (an explicit `--oracle-cache` pointing at the wrong table is
+  caught too);
+- the grid is a flag, `--oracle-grid-resolution` (default 25, unchanged).
+
+**Existing results are unaffected.** Every saved temperature run used
+`--smoothing 1.0`, grid 25 and `oracle_d200.npz`. Rebuilding that table from
+the current `processed.npz` reproduces it exactly (max difference 0.0), and
+re-running `preprocess.py` reproduces `processed.npz` exactly. Their `run.json`
+still names `oracle_d200.npz`, which has no stored settings and is therefore
+accepted unchecked, so they re-score as before. The first *new* run builds
+`oracle_d200_g25_s1.npz` once (~30–60 s).
+
+---
+
 ## Priority 1 — The clock
 
 ### Environment speed is now separate from run duration
@@ -197,4 +224,4 @@ regret scale of ~1.0). Its oracle grid-searches space at 25×25 over `[0, 1]²`
 while the optimizer may query anywhere, so it can occasionally find a point
 better than the grid's best. This is the **spatial** grid, so
 `--oracle-density` does not address it; it needs a higher
-`oracle_grid_resolution` or an optimizer-based oracle.
+`--oracle-grid-resolution` or an optimizer-based oracle.

@@ -29,7 +29,8 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))  # for `common`
 
 import common
-from objective import DEFAULT_ORACLE_DENSITY, ENV_SPAN, build_objective
+from objective import (DEFAULT_ORACLE_DENSITY, DEFAULT_ORACLE_GRID_RESOLUTION, ENV_SPAN,
+                       build_objective, oracle_cache_name)
 from paths import DATA_DIR
 
 # Average regret reported for W-DBO on Temperature in the paper's Table 2.
@@ -40,8 +41,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     parser.add_argument("--processed", type=Path, default=DATA_DIR / "processed.npz")
     parser.add_argument("--oracle-cache", type=Path, default=None,
-                        help="Defaults to data/temperature/oracle_d<density>.npz. The density is in the "
-                             "name because a table built at another density is a different table.")
+                        help="Defaults to data/temperature/oracle_d<density>_g<grid>_s<smoothing>.npz. "
+                             "All three are in the name because a table built under any other value is a "
+                             "different table; the file also stores them, plus a fingerprint of --processed, "
+                             "and a mismatch is refused on load.")
     parser.add_argument("--smoothing", type=float, default=1.0, help="RBF interpolation smoothing (in temperature units^2).")
     parser.add_argument("--duration-seconds", type=float, default=common.REFERENCE_DURATION,
                         help="Real wall-clock budget per replication, measured from the end of the initial "
@@ -57,6 +60,8 @@ def main():
                         help="Environment time the initial design starts at.")
     parser.add_argument("--oracle-density", type=float, default=DEFAULT_ORACLE_DENSITY,
                         help="Oracle table samples per unit of environment time.")
+    parser.add_argument("--oracle-grid-resolution", type=int, default=DEFAULT_ORACLE_GRID_RESOLUTION,
+                        help="Points per axis of the spatial grid the oracle searches over [0, 1]^2.")
     common.add_criterion_arguments(parser)
     parser.add_argument("--n-seeds", type=int, default=10, help="Number of independent replications (paper uses 10).")
     parser.add_argument("--seed", type=int, default=0, help="Base seed; replication i uses seed + i.")
@@ -66,7 +71,8 @@ def main():
     args = parser.parse_args()
 
     out_dir = args.results_dir or common.results_dir(DATA_DIR / "results", args.label)
-    oracle_cache = args.oracle_cache or DATA_DIR / f"oracle_d{args.oracle_density:g}.npz"
+    oracle_cache = args.oracle_cache or DATA_DIR / oracle_cache_name(
+        args.oracle_density, args.oracle_grid_resolution, args.smoothing)
 
     # The environment clock, resolved before anything is built: `env_speed`
     # defaults to the paper's 600s-per-day setting whatever --duration-seconds
@@ -80,6 +86,7 @@ def main():
     print("Building objective (RBF fit + oracle grid search, ~30-60s, cached afterwards)...")
     objective = build_objective(args.processed, smoothing=args.smoothing,
                                 oracle_density=args.oracle_density,
+                                oracle_grid_resolution=args.oracle_grid_resolution,
                                 oracle_cache_path=oracle_cache)
     # Before spending 10 minutes a seed: check the run stays inside the data.
     objective.assert_covers(args.env_t0, schedule["env_end"])

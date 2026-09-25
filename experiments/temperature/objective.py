@@ -15,6 +15,7 @@ caps how far this benchmark can be pushed: at the default environment speed
 one 600s run consumes the whole day, so a longer run needs a proportionally
 lower `--env-speed`, not more data.
 """
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,6 +30,9 @@ ENV_SPAN = (0.0, 1.0)
 # is far smoother in time than Ackley is, so it needs far fewer; this matches
 # the 200-point table the earlier revision built over [0, 1].
 DEFAULT_ORACLE_DENSITY = 200.0
+
+# Points per axis of the spatial grid the oracle searches over [0, 1]^2.
+DEFAULT_ORACLE_GRID_RESOLUTION = 25
 
 
 @dataclass
@@ -103,11 +107,53 @@ def compute_oracle_curve(interpolator: RBFInterpolator, density: float, grid_res
     return times, best_values
 
 
+def oracle_cache_name(density: float, grid_resolution: int, smoothing: float) -> str:
+    """Filename encoding every setting the cached table depends on.
+
+    The span is fixed by the data, so it is not in the name. Smoothing is:
+    it changes the RBF surface itself, so a table built under one smoothing
+    and read under another grades `f` against a different function's
+    maximum -- silently wrong regret, not an error.
+    """
+    return f"oracle_d{density:g}_g{grid_resolution}_s{smoothing:g}.npz"
+
+
+def data_fingerprint(data: dict) -> str:
+    """SHA-256 of the point cloud the RBF is fitted to.
+
+    A filename cannot tell that `processed.npz` was regenerated with other
+    preprocessing options, so the table stores this and `build_objective`
+    checks it on load.
+    """
+    digest = hashlib.sha256()
+    for key in ("points", "temperature"):
+        digest.update(np.ascontiguousarray(data[key], dtype=np.float64).tobytes())
+    return digest.hexdigest()
+
+
+def _check_cache(path: Path, cached, expected: dict) -> None:
+    """Refuse a cached table built under different settings or data.
+
+    Tables written before these keys were stored carry none of them and are
+    accepted unchecked, so older runs whose `run.json` names them still
+    re-score.
+    """
+    stale = [f"{key}: cached {cached[key].item()!r}, requested {value!r}"
+             for key, value in expected.items()
+             if key in cached.files and cached[key].item() != value]
+    if stale:
+        raise SystemExit(
+            f"The cached oracle {path} was built under different settings:\n  "
+            + "\n  ".join(stale)
+            + "\nDelete it, or pass a different --oracle-cache, and the table will be rebuilt."
+        )
+
+
 def build_objective(
     processed_path: Path,
     smoothing: float = 1.0,
     oracle_density: float = DEFAULT_ORACLE_DENSITY,
-    oracle_grid_resolution: int = 25,
+    oracle_grid_resolution: int = DEFAULT_ORACLE_GRID_RESOLUTION,
     oracle_cache_path: Path | None = None,
 ) -> TemperatureObjective:
     """Build the interpolated objective and its oracle curve.
@@ -116,19 +162,30 @@ def build_objective(
     so it is cached to `oracle_cache_path` and reused across runs; the
     interpolator itself is refit every call since it must live in memory to
     answer per-query evaluations.
+
+    The table is saved with the settings and data fingerprint it was built
+    under, and a cache that disagrees with the requested ones is refused
+    rather than read (see `_check_cache`).
     """
     data = load_processed(processed_path)
     interpolator = RBFInterpolator(data["points"], data["temperature"], kernel="thin_plate_spline", smoothing=smoothing)
     noise_std = float(np.std(data["temperature"]) * np.sqrt(0.05))
+    settings = {
+        "density": float(oracle_density),
+        "grid_resolution": int(oracle_grid_resolution),
+        "smoothing": float(smoothing),
+        "data_sha256": data_fingerprint(data),
+    }
 
     if oracle_cache_path is not None and oracle_cache_path.exists():
         cached = np.load(oracle_cache_path)
+        _check_cache(oracle_cache_path, cached, settings)
         oracle_times, oracle_values = cached["times"], cached["values"]
     else:
         oracle_times, oracle_values = compute_oracle_curve(interpolator, oracle_density, oracle_grid_resolution)
         if oracle_cache_path is not None:
             oracle_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez(oracle_cache_path, times=oracle_times, values=oracle_values)
+            np.savez(oracle_cache_path, times=oracle_times, values=oracle_values, **settings)
 
     return TemperatureObjective(
         interpolator=interpolator,

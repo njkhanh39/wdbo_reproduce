@@ -744,15 +744,19 @@ def load_objective(metadata: dict):
         objective = _import_benchmark_module(here / "temperature", "objective.py",
                                              "wdbo_temperature_objective")
         density = float(args.get("oracle_density", objective.DEFAULT_ORACLE_DENSITY))
+        # Runs from before the flag existed all searched the default grid.
+        grid = int(args.get("oracle_grid_resolution") or objective.DEFAULT_ORACLE_GRID_RESOLUTION)
+        smoothing = float(args["smoothing"])
         cache = metadata.get("oracle_cache") or args.get("oracle_cache")
         if cache is None:
             paths = _import_benchmark_module(here / "temperature", "paths.py",
                                              "wdbo_temperature_paths")
-            cache = paths.DATA_DIR / f"oracle_d{density:g}.npz"
+            cache = paths.DATA_DIR / objective.oracle_cache_name(density, grid, smoothing)
         return objective.build_objective(
             Path(args["processed"]),
-            smoothing=float(args["smoothing"]),
+            smoothing=smoothing,
             oracle_density=density,
+            oracle_grid_resolution=grid,
             oracle_cache_path=Path(cache),
         )
 

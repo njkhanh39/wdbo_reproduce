@@ -195,6 +195,17 @@ spent:
 Before trusting a new `--env-speed`, double the density and check that `f*`
 does not move.
 
+**Cache files are keyed by everything that shapes the table.** A table built
+under other settings is a different table, and reading it silently grades `f`
+against the wrong maximum.
+
+| Benchmark | Cache file | Also checked on load |
+|---|---|---|
+| `ackley4d` | `oracle_t<lo>_<hi>_d<density>_g<grid>.npz` | — (the function is closed-form) |
+| `temperature` | `oracle_d<density>_g<grid>_s<smoothing>.npz` | the stored settings plus a SHA-256 of `processed.npz`'s point cloud, so a re-run `preprocess.py` with other options is refused, not read |
+
+The temperature spatial grid is `--oracle-grid-resolution` (default 25).
+
 ---
 
 ## 4. Metrics
