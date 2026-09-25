@@ -116,11 +116,21 @@ so forming all `n` of them costs one matrix product. What is *not* free is the
 max-value solve on top: `n·|T|` Gumbel fits per clean instead of `|T|`. Measured
 at `--mi-candidates 512`, `--mi-times 8`: 0.03 s → 0.6 s at `n = 50`, 0.11 s →
 5.0 s at `n = 250`. Under a fixed wall-clock budget that is fewer queries, so
-`--mi-fstar-full` restores the shared full-`D` sample set (Week 2 §3.1's
+`--mi-fstar full` restores the shared full-`D` sample set (Week 2 §3.1's
 argument: the correction is rank-one in a posterior conditioned on `n` points)
-for runs where the cost matters more than the conditioning.
+for runs where the cost matters more than the conditioning. `--mi-fstar is`
+keeps that shared set and reweights it per `i` instead — see
+[§3a](#3a-importance-sampling---mi-fstar-is-week-3).
 
-Three implementation notes:
+| `--mi-fstar` | samples of `f*_t` | Gumbel fits per clean | `n = 250` cost |
+|---|---|---|---|
+| `loo` (default) | one set per `D̃_i` | `n·\|T\|` | 3–5 s |
+| `full` | one set under `D`, shared | `\|T\|` | 0.05–0.11 s |
+| `is` | the `full` set, reweighted towards each `D̃_i` | `\|T\|` | 0.07–0.15 s |
+
+(`--mi-fstar-full` still works as an alias for `--mi-fstar full`.)
+
+Implementation notes:
 
 - The per-`i` percentile solves are **batched**: one active set of `n·3` scalar
   roots solved by safeguarded Newton, roots dropping out as they converge. A
@@ -137,6 +147,118 @@ Three implementation notes:
 - Bisect on `log P`, not `P`. A product of ~500 normal CDFs underflows to a flat
   zero well inside the textbook bracket, leaving the root-finder nothing to
   descend.
+
+## 3a. Importance sampling (`--mi-fstar is`, Week 3)
+
+### The idea
+
+Estimate all `n` expectations `E_{f*_t | D̃_i}[H(y_i | f*_t, D̃_i)]` from the
+**one** sample set `S_t ~ f*_t | D` that `full` already draws, by weighting it
+differently for each `i`. By Bayes, with `D = D̃_i ∪ {y_i^obs}`,
+
+```
+p(f*_t | D̃_i) / p(f*_t | D) = p(y_i^obs | D̃_i) / p(y_i^obs | f*_t, D̃_i)      (exact)
+```
+
+and under the two assumptions the entropy step already makes — conditioning on
+`f*_t` ≈ conditioning on `{v_i ≤ f*_t}` (c), and `y_i ⊥ f*_t | v_i` (d) — the
+denominator is `p(y_i^obs | D̃_i) · Φ(γ_i^full)/Φ(γ_i^loo)`, so
+
+```
+w_i(f̂*) = Φ(γ_i^loo) / Φ(γ_i^full) = P(v_i ≤ f̂* | D̃_i) / P(v_i ≤ f̂* | D)
+γ_i^loo  = (f̂* − E[v_i | D̃_i]) / sd[v_i | D̃_i],   γ_i^full likewise under D
+
+E[H(y_i | f*_t, D̃_i)] ≈ Σ_{f̂* ∈ S_t} w̄_i(f̂*) · H(y_i | f̂*, D̃_i),   w̄_i = w_i / Σ w_i
+```
+
+Self-normalized because (c) and (d) are approximations, so the raw weights do
+not average to one. `v_i | D` needs no rank-one correction (`full_data_moments`);
+`v_i | D̃_i` is already computed for the entropy term. The ratio is formed as
+`exp(log_ndtr − log_ndtr)`: for a sample far below `E[v_i]` both `Φ`s underflow.
+Cost is `full` plus one `n × n` product per future time — 0.07–0.15 s against
+`loo`'s 3–5 s at `n = 250` (timings vary run to run).
+
+### What it does in practice: the weights are ≈ 1
+
+Measured by [`compare_fstar_sampling.py`](compare_fstar_sampling.py), on
+GP-prior datasets with the hyperparameters the surrogate actually fits
+(medians from logged `ackley4d` / `temperature` runs, plus a low-noise 2-D case):
+the effective sample size of the weights is **≥ 0.9999·K for every (i, t)** in
+all three scenarios, so `is` reproduces `full` to within Monte-Carlo noise.
+
+The reason is structural, not numerical. `w_i` moves away from 1 only when
+`P(v_i ≤ f̂*)` differs between `D` and `D̃_i`, i.e. only when an observation's
+*own* future value is within a few standard deviations of the maximum. For
+everything else `Φ(γ^loo) ≈ Φ(γ^full) ≈ 1`. But the leave-one-out shift of
+`f*_t` is real for such points too — dropping `y_i` inflates the posterior
+variance of the whole neighbourhood of `x_i`, which moves the max — and
+assumption (c) is exactly what discards that channel: it keeps only the bound
+`v_i ≤ f*_t` and throws away "a high maximum makes the function near `x_i`
+higher too". The weights are therefore *consistent with the model's own
+entropy approximation* (under (c), `y_i` carries almost no information about
+`f*_t` unless `v_i` is near it, so its removal should barely move `f*_t`
+either), but they cannot recover the LOO shift that `loo` samples.
+
+### How much any of this matters: the three modes against references
+
+Two references per scenario, candidate set fixed so only the sampling differs:
+**joint-LOO** samples `f*_t | D̃_i` from *joint* (correlated) posterior draws
+over the candidates — no independence approximation, the covariances for all
+`i` via `Cov_i = Cov + m_i m_iᵀ / A_ii` — and **Gumbel-LOO** is `loo` at
+`K = 4000`, i.e. what `loo` converges to. 12 replicates per `(mode, K)`.
+Error is the RMSE of `log10(estimate / reference)` over observations.
+
+| scenario | mode | vs Gumbel-LOO, K=32 | K=128 | vs joint-LOO, K=128 | argmin = joint-LOO's |
+|---|---|---|---|---|---|
+| ackley-like (d=4, n=60, σ²=0.17) | full | 0.046 | 0.025 | 0.219 | 100 % |
+| | loo | 0.045 | 0.024 | 0.218 | 100 % |
+| | is | 0.046 | 0.025 | 0.219 | 100 % |
+| temperature-like (d=3, n=45, σ²=0.6) | full | 0.048 | 0.028 | 0.796 | 100 % |
+| | loo | 0.046 | 0.024 | 0.797 | 100 % |
+| | is | 0.048 | 0.028 | 0.796 | 100 % |
+| low noise (d=2, n=60, σ²=0.02) | full | 0.058 | 0.037 | 1.276 | 83 % |
+| | loo | 0.051 | 0.026 | 1.281 | 83 % |
+| | is | 0.058 | 0.037 | 1.276 | 83 % |
+| *all three* | joint-full (no LOO, exact max) | | | 0.007 – 0.011 | 100 % |
+
+Read in that order:
+
+1. **Against what `loo` converges to**, the three modes are within Monte-Carlo
+   noise of each other; `full`/`is` keep a bias of ~0.01 decades (≈ 2–5 %) that
+   `loo` does not, visible only in the low-noise case. Spearman ≥ 0.999
+   everywhere.
+2. **Against the faithful reference, all three are off by 0.2–1.3 decades,
+   identically.** Joint samples *without* leave-one-out (`joint-full`) are off
+   by only 0.007–0.011. So the error in `f*_t` sampling comes almost entirely
+   from the **independence approximation in the Gumbel CDF**, not from which
+   posterior it is conditioned on. Treating hundreds of strongly correlated
+   candidates as independent overstates `f*_t` (in the 2-D case, median 1.7
+   vs 0.9), which pushes every `γ` up and every relevance down — by more when
+   `l_S` is long relative to the candidate spacing.
+3. In the two realistic scenarios the error is close to a **uniform shift in
+   log space** (Spearman 0.997–0.9998 vs joint-LOO, argmin always right), so
+   for *ranking* — the `argmin` the removal loop takes — it mostly washes out.
+   In the low-noise case it is not uniform (−0.5 to −2 decades per point,
+   Spearman 0.97) and the argmin is right in only 83 % of replicates — equally
+   for all three modes. It
+   does not wash out of the **budget**: `--mi-alpha` is calibrated in nats
+   against the biased scale.
+
+### Recommendation
+
+- `is` is correct as derived and costs as little as `full`, but at the
+  hyperparameters we fit it is numerically indistinguishable from `full`.
+  It only departs from `full` for observations whose future value sits near the
+  maximum, which are never removal candidates.
+- `loo` buys ~0.01 decades over `full` at 20–40× the cost. At a fixed
+  wall-clock budget, `full` or `is` is the better trade.
+- The error worth fixing is the Gumbel independence approximation (item 2), and
+  it is shared by all three modes.
+
+Figures: `data/fstar_sampling/` — `per_point_bias.png` (error per observation vs
+joint-LOO), `error_vs_samples.png`, `fstar_distributions.png` (the `f*_t` CDFs
+of all five samplers for the observation with the largest true LOO shift),
+`runtime.png`, and `summary.json`.
 
 ## 4. Time grid and weights
 
@@ -283,14 +405,25 @@ reproduce the original W-DBO behaviour; the library default in
 python experiments/validate_mi_criterion.py
 ```
 
-36 checks, none of which need an experiment to run: the four leave-one-out
+57 checks, none of which need an experiment to run: the four leave-one-out
 identities against explicit refitting (4e-16), `s_i²` against a 2M-draw Monte
 Carlo over the truncated bridge variable (0.05–0.23 %), the deficit against
 `scipy.stats.truncnorm` and against both its asymptotes, the Gumbel samples
 against the quartiles of the max-value CDF they were fitted to, and end-to-end
 properties of the relevance vector — non-negative, permutation-equivariant,
 lower for stale observations, near zero for a duplicated one, and free of ties
-in the small-`l_T` regime where it previously underflowed.
+in the small-`l_T` regime where it previously underflowed. For `--mi-fstar is`:
+the full-data moments of `v_i` against the GP formula, the Bayes step that the
+importance weights rest on (conditioning `(y_i, v_i) | D̃_i` on the observed
+`y_i` recovers `v_i | D`, Week 3 eq. 15, to 2e-16), the weights against the
+direct `Φ` ratio, and their finiteness when both `Φ`s underflow.
+
+How close each sampling mode gets to the quantity it estimates is a statistical
+question, not an identity, so it lives in a separate script — see §3a:
+
+```bash
+python experiments/compare_fstar_sampling.py [--quick]
+```
 
 ## 10. References
 

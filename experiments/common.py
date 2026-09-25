@@ -54,6 +54,7 @@ import gpytorch
 import numpy as np
 import torch
 
+from wdbo_algo.mi_criterion import FSTAR_SOURCES
 from wdbo_algo.mi_optimizer import MIDBOOptimizer
 from wdbo_algo.optimizer import WDBOOptimizer
 from scoring import score_run
@@ -105,7 +106,7 @@ def query_fields(spatial_dim: int) -> list[str]:
         # When, in real seconds, each stage of the iteration happened.
         "t_iter_start", "t_apply", "t_result", "t_update_done",
         # How long each stage took.
-        "t_acq", "t_eval", "t_fit", "t_acq_fit", "t_clean",
+        "t_acq", "t_eval", "t_fit", "t_acq_fit", "t_clean", "t_response",
         # What was queried and what came back.
         *[f"x_{i}" for i in range(spatial_dim)], "y", "true_value", "regret",
         "dataset_size", "n_removed",
@@ -208,7 +209,7 @@ def print_progress(fraction: float, row: dict, prefix: str = "", bar_width: int 
     bar = "#" * filled + "-" * (bar_width - filled)
     print(
         f"\r{prefix}[{bar}] {fraction * 100:5.1f}%"
-        f" | size={row['dataset_size']:4d} | resp={row['t_acq_fit']:5.2f}s"
+        f" | size={row['dataset_size']:4d} | resp={row['t_response']:5.2f}s"
         f" | clean={row['t_clean']:5.2f}s | lT={row['lT']:.3g}",
         end="", flush=True,
     )
@@ -319,7 +320,7 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         "wall_time": 0.0,
         "t_iter_start": 0.0, "t_apply": 0.0, "t_result": 0.0, "t_update_done": 0.0,
         "t_acq": float("nan"), "t_eval": float("nan"), "t_fit": float("nan"),
-        "t_acq_fit": float("nan"), "t_clean": float("nan"),
+        "t_acq_fit": float("nan"), "t_clean": float("nan"), "t_response": float("nan"),
         **{f"x_{i}": float(v) for i, v in enumerate(np.ravel(x))},
         "y": y,
         "true_value": true_value,
@@ -375,9 +376,11 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         t_update_done = time.perf_counter() - start
         t_fit = t_update_done - t_result
 
-        # Removing stale observations advances the wall clock (Algorithm 1 reads
-        # the clock after the removal loop) but is NOT part of the response time:
-        # H.1 defines that as the sum of (i) and (ii) only.
+        # (iii) remove stale observations. This advances the wall clock
+        # (Algorithm 1 reads the clock after the removal loop), and -- a
+        # deliberate departure from H.1, which counts only (i) + (ii) -- it IS
+        # part of our response time: the next query cannot start until it ends,
+        # so an expensive removal rule must pay for itself in `t_response`.
         size_before = optimizer.dataset_size()
         if criterion != "none" and t_update_done < duration_seconds:
             optimizer.clean(env_start + env_speed * t_update_done)
@@ -398,13 +401,15 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
             "t_apply": t_apply,
             "t_result": t_result,
             "t_update_done": t_update_done,
-            # H.1's response time is (i) + (ii) only; the parts are logged
-            # separately so a slow arm can be blamed on the right stage.
+            # Our response time is (i) + (ii) + (iii). H.1's is (i) + (ii) only,
+            # kept as `t_acq_fit` for comparison with the paper. The parts are
+            # logged separately so a slow arm can be blamed on the right stage.
             "t_acq": t_acq,
             "t_eval": t_eval,
             "t_fit": t_fit,
             "t_acq_fit": t_acq + t_fit,
             "t_clean": t_step_end - t_update_done,
+            "t_response": t_acq + t_fit + (t_step_end - t_update_done),
             **{f"x_{i}": float(v) for i, v in enumerate(np.ravel(x))},
             "y": y,
             "true_value": true_value,
@@ -492,7 +497,9 @@ def summarize_seed(run: list[dict], score: dict,
         "iterations": len(run),
         "time_avg_regret": score["time_avg_regret"],
         "avg_regret": float(regret.mean()) if len(run) else float("nan"),
-        "avg_response_time": _mean_of(run, "t_acq_fit"),
+        # acquisition + fit + clean; the paper's (i) + (ii) is `avg_acq_fit_time`.
+        "avg_response_time": _mean_of(run, "t_response"),
+        "avg_acq_fit_time": _mean_of(run, "t_acq_fit"),
         # NaN on a legacy log, which only recorded the (i) + (ii) total.
         "avg_acq_time": _mean_of(run, "t_acq"),
         "avg_fit_time": _mean_of(run, "t_fit"),
@@ -512,6 +519,7 @@ HEADLINE_METRICS = [
     ("time_average_regret", "time_avg_regret"),
     ("query_average_regret", "avg_regret"),
     ("response_time_s", "avg_response_time"),
+    ("acq_fit_time_s", "avg_acq_fit_time"),
     ("clean_time_s", "avg_clean_time"),
     ("iterations", "iterations"),
 ]
@@ -655,6 +663,8 @@ def load_run(out_dir: Path) -> tuple[list[list[dict]], dict]:
 
     Older logs lacking x or application events cannot be scored and must be
     rerun. Their old summary and plots must not be relabeled as time regret.
+    Logs predating the `t_response` column get it rebuilt as
+    `t_acq_fit + t_clean`, which is exactly what the loop now writes.
     """
     metadata = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
 
@@ -668,6 +678,10 @@ def load_run(out_dir: Path) -> tuple[list[list[dict]], dict]:
         for raw in reader:
             row = {k: (int(v) if k in ints else float(v))
                    for k, v in raw.items()}
+            # Logs written before response time included cleaning: rebuild it
+            # from the stages they did record.
+            if "t_response" not in row:
+                row["t_response"] = row["t_acq_fit"] + row["t_clean"]
             if not runs or row["iteration"] <= runs[-1][-1]["iteration"]:
                 runs.append([])
             runs[-1].append(row)
@@ -830,11 +844,14 @@ def save_response_time_plot(runs: list[list[dict]], per_seed: list[dict], path: 
 
     The paper draws one box per algorithm; running W-DBO alone, we scatter every
     query, mark each seed's own average, and put the mean of those on top.
+
+    Response time here is acquisition + fit + clean (`t_response`), not the
+    paper's acquisition + fit, so an arm's removal cost shows on the x-axis.
     """
     import matplotlib.pyplot as plt
     import textwrap
 
-    response = np.array([row["t_acq_fit"] for run in runs for row in queries_only(run)])
+    response = np.array([row["t_response"] for run in runs for row in queries_only(run)])
     regret = np.array([row["regret"] for run in runs for row in queries_only(run)])
     valid = [row for row in per_seed if row["iterations"] > 0]
     seed_response = np.array([row["avg_response_time"] for row in valid])
@@ -852,7 +869,7 @@ def save_response_time_plot(runs: list[list[dict]], per_seed: list[dict], path: 
     else:
         ax.text(0.5, 0.5, "No queries within this run", ha="center", va="center",
                 transform=ax.transAxes)
-    ax.set(xlabel="Acquisition + fit time (s)", ylabel="Query regret")
+    ax.set(xlabel="Acquisition + fit + clean time (s)", ylabel="Query regret")
     ax.set_title(textwrap.fill(title or "Query regret vs. response time", width=42), fontsize=9)
 
     fig.tight_layout()
@@ -935,11 +952,15 @@ def add_criterion_arguments(parser):
     parser.add_argument("--mi-weight", choices=("kernel", "uniform"), default="kernel",
                         help="Weighting of future times: proportional to the temporal kernel, or flat. "
                              "Measured effect is a uniform factor of ~2 in magnitude and almost none on ranking.")
+    parser.add_argument("--mi-fstar", choices=FSTAR_SOURCES, default="loo",
+                        help="How f*_t is sampled. loo: one Gumbel fit per leave-one-out posterior "
+                             "(n per future time). full: one fit under the full data, shared by every "
+                             "observation (cheap, but conditions f*_t on the observation being scored). "
+                             "is: the full-data samples reweighted towards each leave-one-out posterior "
+                             "by importance sampling (Week 3); costs about as much as full. "
+                             "See MI_CRITERION.md section 3.")
     parser.add_argument("--mi-fstar-full", action="store_true",
-                        help="Sample f*_t once from the full-data posterior and share it across every "
-                             "observation, instead of the default per-leave-one-out sampling. Cheaper "
-                             "(one Gumbel fit per future time instead of n), but conditions f*_t on the "
-                             "observation being scored.")
+                        help="Deprecated alias for --mi-fstar full.")
     parser.add_argument("--mi-clip-horizon", action="store_true",
                         help="Cap the criterion's future horizon at the environment time the run ends at, "
                              "instead of letting it run as far as the model's own lengthscale reaches.")
@@ -977,10 +998,10 @@ def criterion_settings(args, env_end: float) -> tuple[str, float, dict, str]:
         n_max_samples=args.mi_max_samples,
         n_candidates=args.mi_candidates,
         weight=args.mi_weight,
-        fstar_source="full" if args.mi_fstar_full else "loo",
+        fstar_source="full" if args.mi_fstar_full else args.mi_fstar,
         clip_horizon=env_end if args.mi_clip_horizon else None,
     )
-    fstar_note = "" if mi_options["fstar_source"] == "loo" else ", f* from full D"
+    fstar_note = {"loo": "", "full": ", f* from full D", "is": ", f* by importance sampling"}[mi_options["fstar_source"]]
     return criterion, args.mi_alpha, mi_options, f"mi, alpha={args.mi_alpha:g} nats{fstar_note}"
 
 

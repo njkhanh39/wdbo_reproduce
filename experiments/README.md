@@ -231,21 +231,32 @@ charges an arm for every second it sat on a stale configuration.
 `python experiments/plot.py RESULTS_DIR` rebuilds the objective from `run.json`, then recomputes the tables and figures. Logs without coordinates or application events are rejected and must be rerun. The oracle remains an approximation from a spatial search grid and cached time curve; refine those grids before interpreting small differences between methods.
 ### Speed
 
-`t_acq_fit` is Appendix H.1's response time: acquisition optimization (ii)
-plus GP conditioning and hyperparameter re-estimation (i). The parts are
-logged separately too, so a slow arm can be blamed on the right stage:
+**Our response time is `t_response = t_acq + t_fit + t_clean`**: acquisition
+optimization, GP conditioning and hyperparameter re-estimation, *and* the
+removal loop. The parts are logged separately too, so a slow arm can be
+blamed on the right stage:
 
 | Column | What it times |
 |---|---|
 | `t_acq` | optimizing the acquisition function — H.1's (ii) |
 | `t_fit` | `tell()`: conditioning the GP and re-estimating hyperparameters — H.1's (i) |
-| `t_acq_fit` | `t_acq + t_fit`, i.e. H.1's response time |
+| `t_clean` | `clean()`: the removal loop — our (iii) |
+| `t_response` | `t_acq + t_fit + t_clean` — **our response time**, the headline `response_time_s` |
+| `t_acq_fit` | `t_acq + t_fit` — H.1's response time, kept as `acq_fit_time_s` for comparison with the paper |
 | `t_eval` | querying `f` — the harness's cost, not the algorithm's, but it still advances the wall clock |
-| `t_clean` | the removal loop — advances the clock, but explicitly *not* part of response time |
 
-Keeping `t_clean` out of the response time follows H.1, which defines it as
-(i) + (ii) only. Keeping it *logged* is how you find out that an arm's
-cleaning rule is eating its own budget.
+> **This departs from the paper.** Appendix H.1 defines response time as
+> (i) + (ii) only and leaves cleaning out. We include it on purpose. The next
+> query cannot start until `clean()` returns, so removal time delays the next
+> decision exactly as much as fitting does, and the world keeps moving
+> meanwhile. Leaving it out would let an expensive removal rule, such as the
+> MI criterion with many candidates, look free on the speed axis while it
+> pays in regret. Removal cost is the thing being compared between arms, so
+> it belongs in the metric.
+>
+> To compare with the paper's numbers, use `t_acq_fit` / `acq_fit_time_s`,
+> not `t_response`. `t_eval` stays out of both: querying `f` is the
+> harness's cost, not the algorithm's.
 
 ---
 
@@ -289,7 +300,7 @@ Each run writes a timestamped directory under
 | `per_seed.csv` | One row per replication: the summary stats plus `warmup_seconds`, `elapsed_seconds`, `overran` and the environment interval covered. |
 | `summary.csv` | Mean ± standard error across seeds, for the quotable metrics. |
 | `run.json` | Provenance: all arguments, the resolved environment schedule, git commit, host, thread count, library versions. |
-| `*.png` | Regret and dataset size vs. duration; regret vs. response time; an `lT`/removal-budget diagnostic panel (not in the paper). |
+| `*.png` | Regret and dataset size vs. duration; regret vs. response time (acquisition + fit + clean); an `lT`/removal-budget diagnostic panel (not in the paper). |
 
 Everything except `queries.csv` is a *view* over it. A replication costs ten
 minutes, so change a plot and re-render with
@@ -307,6 +318,7 @@ minutes, so change a plot and re-render with
 | `t_result` | when the reading was in hand |
 | `t_update_done` | when `tell()` returned |
 | `t_acq`, `t_eval`, `t_fit`, `t_acq_fit`, `t_clean` | durations of each stage — the timing split above |
+| `t_response` | `t_acq + t_fit + t_clean`, our response time (§4). Rebuilt on load for logs that predate it |
 | `x_0 … x_{d−1}` | the configuration queried, in the benchmark's own units |
 | `y` | the noisy reading the algorithm saw |
 | `true_value` | `f(x, env_time)`, noise-free — what regret is measured against |

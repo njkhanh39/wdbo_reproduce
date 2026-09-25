@@ -13,6 +13,42 @@ here — they are a separate piece of work.
 
 ---
 
+## Response time includes cleaning (a departure from the paper)
+
+**Decision:** response time is now `t_response = t_acq + t_fit + t_clean`.
+Appendix H.1 defines it as (i) hyperparameter estimation plus (ii)
+acquisition optimization, and leaves the removal loop out. We add it back as
+(iii).
+
+**Why:** the next query cannot be issued until `clean()` returns, so the time
+spent removing delays the next decision exactly as much as fitting does, and
+the environment keeps drifting throughout. The quantity being compared between
+arms is the removal rule, so leaving its cost out of the speed metric would let
+an expensive rule (MI with many candidates, say) look free on the speed axis
+while paying for it in regret. `t_clean` is often the same order of magnitude
+as `t_acq_fit`, so the difference is not cosmetic.
+
+| | Before | After |
+|---|---|---|
+| `response_time_s` / `avg_response_time` | mean `t_acq_fit` | mean `t_response` |
+| `regret_vs_response_time.png` x-axis | acquisition + fit | acquisition + fit + clean |
+| progress bar `resp=` | `t_acq_fit` | `t_response` |
+| paper-comparable figure | `response_time_s` | `acq_fit_time_s` / `avg_acq_fit_time` (new) |
+
+`t_acq_fit` is still logged unchanged. **Quote `acq_fit_time_s` when
+comparing against the paper's response times**, and `response_time_s` when
+comparing arms against each other.
+
+**Older logs:** `load_run` rebuilds `t_response` as `t_acq_fit + t_clean` for
+logs written before the column existed, so `plot.py` re-renders them under
+the new definition without re-running. Their *existing* `summary.csv` and
+`per_seed.csv` still hold the old (acquisition + fit) response time until you
+re-run `plot.py` on them. The pre-clock logs that used a column named
+`t_response` for acquisition + fit are rejected by `load_run` anyway (they
+have no `x`), so the name cannot be misread.
+
+---
+
 ## Priority 1 — The clock
 
 ### Environment speed is now separate from run duration

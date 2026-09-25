@@ -223,16 +223,19 @@ objective and its cached oracle curve.
   got). One value per query.
 - **Query-average regret** (`avg_regret`): mean noise-free regret at the query measurement instants. It describes the selected points, but omits idle intervals. The paper does not state enough detail to assume its Table 2 uses exactly this convention.
 - **Time-average regret** (`time_avg_regret`): the post-run integral of `f*(t) - f(x_held(t), t)` over the full wall-clock horizon, divided by `H`. The scorer re-evaluates the held configuration at a common time grid and splits at every application event. This is the primary system metric.
-- **Response time** (`t_acq_fit`): real wall-clock seconds for the two tasks
-  H.1 defines it as — (i) estimating the kernel and noise hyperparameters and
-  (ii) optimizing the acquisition function. **Cleaning is not included**, and
-  neither is querying the objective (H.1: "the objective function is
-  immediately sampled"). Both still advance the wall clock — Algorithm 1
-  reads the clock *after* the removal loop — they just aren't part of the
-  metric. `t_clean` and `t_eval` are logged separately; `t_clean` is
-  frequently comparable to `t_acq_fit` in size, so conflating them overstates
-  response time badly. The two halves are logged separately too, as `t_acq`
-  and `t_fit`, so a slow arm can be blamed on the right stage.
+- **Response time** (`t_response`): real wall-clock seconds for (i)
+  estimating the kernel and noise hyperparameters, (ii) optimizing the
+  acquisition function, and (iii) removing stale observations
+  (`clean()`). **Including (iii) departs from the paper.** H.1 counts only
+  (i) + (ii). We count cleaning because the next query cannot start until it
+  finishes, and `t_clean` is often comparable in size to `t_acq_fit`, so
+  leaving it out would hide most of an expensive removal rule's cost (see
+  [`../README.md`](../README.md) §4). H.1's figure is still logged as
+  `t_acq_fit`; use it when comparing against the paper. Querying the
+  objective is excluded from both (H.1: "the objective function is
+  immediately sampled"), though `t_eval` still advances the wall clock. Every
+  stage is logged separately (`t_acq`, `t_fit`, `t_clean`, `t_eval`), so a
+  slow arm can be blamed on the right stage.
 - **Dataset size**: how many points W-DBO's internal model currently holds,
   after stale ones are cleaned out. Floored at 2 (the cleaning loop stops at
   `xx_tt.shape[0] > 2`).
@@ -272,9 +275,10 @@ however many queries it makes, machine-dependent. Columns:
 | `wall_time` | elapsed real seconds at the end of the step |
 | `t_acq` | seconds optimizing the acquisition function — H.1's (ii) |
 | `t_fit` | seconds in `tell()`: conditioning the GP and re-estimating hyperparameters — H.1's (i) |
-| `t_acq_fit` | `t_acq + t_fit`, i.e. H.1's response time |
+| `t_acq_fit` | `t_acq + t_fit`, i.e. H.1's response time (for comparison with the paper) |
 | `t_eval` | seconds querying `f` — the harness's cost, not the algorithm's |
-| `t_clean` | seconds spent in `clean()` — advances the clock, but not part of `t_acq_fit` |
+| `t_clean` | seconds spent in `clean()` |
+| `t_response` | `t_acq + t_fit + t_clean` — **our response time** (departs from H.1; see above) |
 | `t_iter_start`, `t_apply`, `t_result`, `t_update_done` | elapsed seconds at each stage. `t_apply` is when `x` took effect — see [`../README.md`](../README.md) §4 |
 | `x_0`, `x_1` | the configuration queried, in the normalized `[0, 1]²` sensor plane |
 | `y` | the noisy reading the algorithm saw |
@@ -294,8 +298,8 @@ excluded from every metric and its stage timings are `NaN` — filter on
 
 #### `per_seed.csv` — one row per replication
 
-`iterations`, `time_avg_regret`, `avg_regret`, mean `t_acq_fit` and
-`t_clean`, final/max/min dataset size, `median_lT`, `total_removed`, plus
+`iterations`, `time_avg_regret`, `avg_regret`, mean `t_response`
+(`avg_response_time`), `t_acq_fit` (`avg_acq_fit_time`) and `t_clean`, final/max/min dataset size, `median_lT`, `total_removed`, plus
 `warmup_seconds` and the environment interval the run covered. This
 is the file that shows "8 seeds fine, 2 stuck at 2" at a glance, and
 `iterations` is the check on whether your machine is doing comparable work to
@@ -304,7 +308,8 @@ the paper's (an i9-9980HK, 8 cores / 16 threads).
 #### `summary.csv` — the headline numbers
 
 `metric, mean, sem, n_runs` for time-average regret, query-average regret,
-response time, clean time and iteration count. **Standard error, not
+response time (acquisition + fit + clean), H.1's acquisition + fit time,
+clean time and iteration count. **Standard error, not
 variance**: Table 2 underlines algorithms whose confidence intervals overlap
 the best one's, so the SEM is what makes the comparison. The paper's W-DBO
 figure for Temperature is **0.68**; the script prints it alongside your own.
@@ -333,8 +338,8 @@ behind it. See §6.
 
 #### `regret_vs_response_time.png` (1 panel)
 
-Every query's `(t_acq_fit, instantaneous regret)` scattered across all
-seeds, plus **one orange marker per seed** at that seed's own average and a
+Every query's `(t_response, instantaneous regret)` scattered across all
+seeds, where the x-axis is acquisition + fit + clean time, plus **one orange marker per seed** at that seed's own average and a
 black X at the mean of those. Mirrors Figure 20 (left) — the paper overlays one
 box per baseline algorithm; running W-DBO alone, the per-seed markers are what
 show the spread.

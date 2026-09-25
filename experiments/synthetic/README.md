@@ -164,9 +164,10 @@ description; in brief:
 
 - **`queries.csv`** — the raw per-query log, every seed, no resampling. The
   only irreplaceable file; everything else is a view over it. Includes
-  `t_acq_fit` (H.1's definition: hyperparameter estimation + acquisition
-  optimization, *excluding* cleaning) along with its `t_acq` / `t_fit` parts
-  and `t_eval`, plus `t_clean`, `n_removed`, and the MLE hyperparameters
+  `t_response` (our response time: acquisition + fit + clean, which departs
+  from the paper), `t_acq_fit` (H.1's definition, *excluding* cleaning, kept
+  for comparison with the paper), the `t_acq` / `t_fit` / `t_clean` parts and
+  `t_eval`, plus `n_removed`, and the MLE hyperparameters
   `lambda, lS, lT, noise` plus `removal_budget` per query. `env_time` is
   absolute environment time, not a normalized fraction. Also the queried point
   `x_0..x_2`, its reading `y`, the noise-free `true_value`, and the stage
@@ -174,7 +175,7 @@ description; in brief:
   re-scored afterwards. Each replication opens with an `iteration = −1` row
   holding the initial configuration; it is excluded from every metric.
 - **`per_seed.csv`** — one row per replication: iteration count, integrated
-  `time_avg_regret` and separate query mean `avg_regret`, mean response and clean time,
+  `time_avg_regret` and separate query mean `avg_regret`, mean response time (acquisition + fit + clean), H.1's acquisition + fit time and clean time,
   final/max/min dataset size, `median_lT`, `total_removed`, plus
   `warmup_seconds` and the environment interval the run covered.
 - **`summary.csv`** — the quotable numbers as `mean, sem, n_runs`. For
@@ -188,7 +189,8 @@ description; in brief:
   between grid points); right: dataset size on a log axis. Both panels draw the across-seed
   mean with every seed faint behind it — seed outcomes can be bimodal, so the
   individual lines matter (temperature README §6).
-- **`regret_vs_response_time.png`** — every query scattered, plus the
+- **`regret_vs_response_time.png`** — every query scattered against its
+  acquisition + fit + clean time (`t_response`), plus the
   one marker per seed and the mean of those; the single-algorithm analogue of
   the paper's per-benchmark left panel.
 - **`lengthscale_and_budget.png`** — not in the paper. `lT` and the removal

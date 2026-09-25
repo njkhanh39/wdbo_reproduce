@@ -62,7 +62,8 @@ class MIDBOOptimizer(WDBOOptimizer):
 				n_candidates (int, optional): candidate points discretizing the space. Defaults to 512.
 				weight (str, optional): "kernel" or "uniform" weighting of future times. Defaults to "kernel".
 				fstar_source (str, optional): "loo" samples f*_t from each leave-one-out posterior, "full"
-				from the full-data posterior once per future time. Defaults to "loo".
+				from the full-data posterior once per future time, "is" reweights those full-data samples
+				towards each leave-one-out posterior by importance sampling. Defaults to "loo".
 				clip_horizon (float, optional): cap the future horizon at this absolute time. Defaults to None.
 				seed (int, optional): seed for the criterion's own sampling. Defaults to None.
 		"""

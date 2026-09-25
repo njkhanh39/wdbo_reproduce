@@ -22,7 +22,10 @@ Estimator (following the MES/OPES line of work):
      `fstar_source="full"` reverts to one shared sample set per `t` drawn from
      the full-`D` posterior: `|T|` Gumbel fits per clean instead of `n.|T|`,
      at the cost of conditioning `f*_t` on the very observation whose
-     information content is being measured.
+     information content is being measured. `fstar_source="is"` keeps the
+     shared full-`D` sample set but reweights it for each `D_i` by importance
+     sampling (Week 3 §3.2, `importance_weights`): `|T|` Gumbel fits, with the
+     conditioning approximately undone through the weights.
 
   2. `H(y_i | f*_t, D_i)` is upper-bounded by the Gaussian entropy of matching
      variance (OPES), which turns the whole problem into computing
@@ -45,6 +48,9 @@ from scipy.stats import qmc
 SQRT3 = np.sqrt(3.0)
 SQRT5 = np.sqrt(5.0)
 LOG_2PI = np.log(2.0 * np.pi)
+
+# Where the f*_t samples come from; see `mi_criterion`.
+FSTAR_SOURCES = ("loo", "full", "is")
 
 # Below this standardized truncation point the direct truncated-variance formula
 # is worthless (see _truncated_normal_rel_var).
@@ -378,6 +384,64 @@ def leave_one_out_moments(A, dA, ahat, C, lam, mean_const):
 	return rho2, mean_v, var_v
 
 
+def full_data_moments(A, ahat, C, lam, mean_const):
+	"""The ordinary full-data posterior of `f` at a set of space-time points.
+
+	Used for the candidate set with `fstar_source="full"`, and for the bridge
+	variable `v_i = f(x_i, t)` with `fstar_source="is"`, whose weights compare
+	`v_i`'s posterior under `D` against the one under `D_i`.
+
+	Args:
+			A (np.array): `n x n` inverse of the full-data covariance matrix
+			ahat (np.array): `A @ (y - mean_const)`
+			C (np.array): `n x m` cross-covariance to the `m` points
+			lam (float): the kernel outputscale
+			mean_const (float): the GP's constant mean
+
+	Returns:
+			(np.array, np.array): the `m` means and variances
+	"""
+	mean = mean_const + C.T @ ahat
+	var = np.maximum(lam - np.einsum("jm,jm->m", C, A @ C), 1e-12)
+	return mean, var
+
+
+def importance_weights(fstar, mean_loo, var_loo, mean_full, var_full):
+	"""Self-normalized weights that turn samples of `f*_t | D` into ones of `f*_t | D_i`.
+
+	Week 3 §3.2. By Bayes, with `D = D_i + {y_i}`,
+	`p(f* | D_i) / p(f* | D) = p(y_i | D_i) / p(y_i | f*, D_i)`. Replacing the
+	conditioning on `f*` by the event `v_i <= f*` (assumption c) and treating
+	`y_i` as independent of `f*` given `v_i` (assumption d) turns the ratio into
+
+		w_i(f*) = Phi(gamma_loo) / Phi(gamma_full) = P(v_i <= f* | D_i) / P(v_i <= f* | D)
+
+	with `gamma = (f* - E[v_i]) / sd[v_i]` under each posterior. Because both
+	assumptions are approximations, the weights do not average to one under
+	`f* | D`, so each row is normalized to sum to one over the sample set.
+
+	The ratio is formed in log space: a sample `f*` sitting far below `E[v_i | D]`
+	makes both `Phi`s underflow, and their ratio is then 0/0 in float64.
+
+	Args:
+			fstar (np.array): the `K` shared samples of `f*_t`, drawn under `D`
+			mean_loo (np.array): `E[v_i | D_i]`, length `n`
+			var_loo (np.array): `Var[v_i | D_i]`, length `n`
+			mean_full (np.array): `E[v_i | D]`, length `n`
+			var_full (np.array): `Var[v_i | D]`, length `n`
+
+	Returns:
+			np.array: `n x K` weights, each row non-negative and summing to 1
+	"""
+	fstar = np.asarray(fstar, dtype=float).ravel()[None, :]
+	gamma_loo = (fstar - mean_loo[:, None]) / np.sqrt(var_loo)[:, None]
+	gamma_full = (fstar - mean_full[:, None]) / np.sqrt(var_full)[:, None]
+
+	log_w = log_ndtr(gamma_loo) - log_ndtr(gamma_full)
+	w = np.exp(log_w - log_w.max(axis=1, keepdims=True))
+	return w / w.sum(axis=1, keepdims=True)
+
+
 def leave_one_out_candidate_moments(A, dA, ahat, CM, lam, mean_const):
 	"""The posterior of `f(x_m, t)` at every candidate `m` under `D_i`, for every `i`.
 
@@ -417,7 +481,7 @@ def leave_one_out_candidate_moments(A, dA, ahat, CM, lam, mean_const):
 def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
                  spatial_nu=2.5, temporal_nu=1.5, n_times=8, horizon_lengthscales=3.0,
                  n_max_samples=32, n_candidates=512, weight="kernel",
-                 fstar_source="loo", clip_horizon=None, rng=None, jitter=1e-8):
+                 fstar_source="loo", clip_horizon=None, candidates=None, rng=None, jitter=1e-8):
 	"""Score every observation by its mutual information with the future maximum.
 
 	The returned relevance is in nats and is non-negative by construction. It is a
@@ -463,17 +527,23 @@ def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
 			`D_i`, as the definition of the conditional mutual information requires;
 			"full" draws one set from the full-`D` posterior and shares it across
 			every `i`, which is `n` times cheaper but conditions `f*_t` on the
-			observation being scored. Defaults to "loo".
+			observation being scored. "is" draws the same shared set as "full" and
+			reweights it per `i` towards `D_i` by importance sampling (Week 3 §3.2,
+			see `importance_weights`), at roughly the cost of "full". Defaults to "loo".
 			clip_horizon (float, optional): cap the future horizon at this absolute
 			time. Defaults to None.
+			candidates (np.array, optional): `n_candidates x d` points in [0, 1]^d
+			discretizing X for the max-value CDF. Defaults to None, a scrambled
+			Sobol set of `n_candidates` points drawn from `rng`. Fixing it isolates
+			the Monte-Carlo error of the `f*_t` samples from the discretization.
 			rng (np.random.Generator, optional): the source of randomness.
 			jitter (float, optional): initial Cholesky jitter. Defaults to 1e-8.
 
 	Returns:
 			np.array: the relevance of each observation, in nats
 	"""
-	if fstar_source not in ("loo", "full"):
-		raise ValueError(f"Unknown fstar_source {fstar_source!r} (expected 'loo' or 'full')")
+	if fstar_source not in FSTAR_SOURCES:
+		raise ValueError(f"Unknown fstar_source {fstar_source!r} (expected one of {FSTAR_SOURCES})")
 
 	rng = np.random.default_rng() if rng is None else rng
 	xx = np.asarray(xx, dtype=float)
@@ -490,7 +560,8 @@ def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
 	# depend on t -- either an observation's own x, or a candidate. So both spatial
 	# Grams are built once here, and each future time is a row rescaling of them.
 	KS = matern(_cdist(xx, xx) / lS, spatial_nu)
-	candidates = qmc.Sobol(d, scramble=True, seed=rng).random(n_candidates)
+	if candidates is None:
+		candidates = qmc.Sobol(d, scramble=True, seed=rng).random(n_candidates)
 	KSM = matern(_cdist(xx, candidates) / lS, spatial_nu)
 
 	KT = matern(np.abs(tt[:, None] - tt[None, :]) / lT, temporal_nu)
@@ -504,6 +575,7 @@ def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
 		scale = (lam * matern(np.abs(tt - t) / lT, temporal_nu))[:, None]
 
 		CM = scale * KSM
+		C = scale * KS
 		if fstar_source == "loo":
 			# f*_t drawn from each D_i in turn, so the sample set entering
 			# I(y_i ; f*_t | D_i) is conditioned on the same data the rest of the
@@ -513,13 +585,13 @@ def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
 			fstar = sample_max_values_gumbel(mean_loo, np.sqrt(var_loo), n_max_samples, rng)
 		else:
 			# One sample set from the full-data posterior, shared across every i:
-			# |T| Gumbel fits per clean rather than n.|T|, at the price of letting
-			# observation i inform the f*_t it is being scored against.
-			mean_m = mean_const + CM.T @ ahat
-			var_m = np.maximum(lam - np.einsum("jm,jm->m", CM, A @ CM), 1e-12)
+			# |T| Gumbel fits per clean rather than n.|T|. Used as-is ("full"), it
+			# lets observation i inform the f*_t it is being scored against; "is"
+			# reweights it towards D_i below instead.
+			mean_m, var_m = full_data_moments(A, ahat, CM, lam, mean_const)
 			fstar = sample_max_values_gumbel(mean_m, np.sqrt(var_m), n_max_samples, rng)[None, :]
 
-		rho2, mean_v, var_v = leave_one_out_moments(A, dA, ahat, scale * KS, lam, mean_const)
+		rho2, mean_v, var_v = leave_one_out_moments(A, dA, ahat, C, lam, mean_const)
 
 		gamma = (fstar - mean_v[:, None]) / np.sqrt(var_v)[:, None]
 		# -0.5 log(1 - z) via log1p: a stale observation has z ~ 1e-20 or smaller,
@@ -527,7 +599,14 @@ def mi_criterion(xx, tt, yy, t0, lam, lS, lT, noise_var, mean_const=0.0,
 		# zero. The whole point of the criterion is to rank those observations
 		# against each other, so they must not all collapse onto the same value.
 		z = rho2[:, None] * truncated_normal_var_deficit(gamma)
-		relevance += w_t * (-0.5 * np.log1p(-np.clip(z, 0.0, 1.0 - 1e-12)).mean(axis=1))
+		mi = -0.5 * np.log1p(-np.clip(z, 0.0, 1.0 - 1e-12))
+
+		if fstar_source == "is":
+			mean_full, var_full = full_data_moments(A, ahat, C, lam, mean_const)
+			weights = importance_weights(fstar, mean_v, var_v, mean_full, var_full)
+			relevance += w_t * (weights * mi).sum(axis=1)
+		else:
+			relevance += w_t * mi.mean(axis=1)
 
 	if not np.all(np.isfinite(relevance)):
 		raise FloatingPointError("mi_criterion produced non-finite relevance values")

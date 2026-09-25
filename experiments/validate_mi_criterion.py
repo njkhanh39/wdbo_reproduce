@@ -29,6 +29,8 @@ from scipy.stats import truncnorm
 sys.path.append(str(Path(__file__).resolve().parents[1] / "src"))
 
 from wdbo_algo.mi_criterion import (  # noqa: E402
+    full_data_moments,
+    importance_weights,
     leave_one_out_candidate_moments,
     leave_one_out_moments,
     matern,
@@ -344,6 +346,89 @@ def test_relevance_behaviour():
           f"duplicate pair {rd[-2]:.3e}, {rd[-1]:.3e} nats vs max {r.max():.3e}")
 
 
+def test_importance_weights():
+    """The pieces `fstar_source="is"` adds on top of the shared full-data samples.
+
+    The weights `Phi(gamma_loo) / Phi(gamma_full)` rest on one exact step (Week 3
+    eq. 15): conditioning the leave-one-out pair `(y_i, v_i)` on the observed
+    `y_i` must give back `v_i`'s full-data posterior. That is checked as an
+    identity between `leave_one_out_moments` and `full_data_moments`, and
+    `full_data_moments` itself against the textbook GP formula. What is not
+    checked here -- because it is an approximation, not an identity -- is how
+    close the reweighted samples get to `f*_t | D_i`; that is what
+    `compare_fstar_sampling.py` measures.
+    """
+    print("\n8. Importance-sampling weights (fstar_source='is')")
+    n, d, mean_const, t = 11, 3, 0.4, 0.83
+    xx, tt, yy = dataset(n, d, seed=1)
+
+    A = np.linalg.inv(kernel(xx, tt, xx, tt) + NOISE * np.eye(n))
+    dA = np.diag(A)
+    ahat = A @ (yy - mean_const)
+    C = kernel(xx, tt, xx, np.full(n, t))
+    _, mean_loo, var_loo = leave_one_out_moments(A, dA, ahat, C, LAM, mean_const)
+    mean_full, var_full = full_data_moments(A, ahat, C, LAM, mean_const)
+
+    ref_mean = mean_const + C.T @ A @ (yy - mean_const)
+    ref_var = LAM - np.einsum("ji,ji->i", C, A @ C)
+    err = max(np.abs(ref_mean - mean_full).max(), np.abs(ref_var - var_full).max())
+    check("full-data moments of v match the GP formula", err < 1e-9, f"max abs error {err:.2e}")
+
+    # Bayes on the bivariate Gaussian (y_i, v_i) | D_i: Var[y_i] = 1/A_ii,
+    # Cov = w_i/A_ii, and the LOO residual y_i - E[y_i | D_i] = ahat_i/A_ii, so
+    # the regression coefficient Cov/Var[y_i] is w_i.
+    w = np.diag(A @ C)
+    bayes_mean = mean_loo + w * (ahat / dA)
+    bayes_var = var_loo - w * w / dA
+    err = max(np.abs(bayes_mean - mean_full).max(), np.abs(bayes_var - var_full).max())
+    check("conditioning (y_i, v_i) | D_i on y_i recovers v_i | D (Week 3 eq. 15)", err < 1e-9,
+          f"max abs error {err:.2e}")
+
+    rng = np.random.default_rng(6)
+    fstar = rng.normal(2.0, 0.5, 64)
+    weights = importance_weights(fstar, mean_loo, var_loo, mean_full, var_full)
+    check("weights are non-negative and each row sums to 1",
+          bool(np.all(weights >= 0.0) and np.allclose(weights.sum(axis=1), 1.0)))
+
+    from scipy.stats import norm
+    raw = norm.cdf((fstar[None, :] - mean_loo[:, None]) / np.sqrt(var_loo)[:, None]) \
+        / norm.cdf((fstar[None, :] - mean_full[:, None]) / np.sqrt(var_full)[:, None])
+    err = np.abs(raw / raw.sum(axis=1, keepdims=True) - weights).max()
+    check("weights match the direct Phi ratio where it is computable", err < 1e-12, f"max abs error {err:.2e}")
+
+    same = importance_weights(fstar, mean_full, var_full, mean_full, var_full)
+    check("identical posteriors give uniform weights", bool(np.allclose(same, 1.0 / fstar.size)))
+
+    # A sample 60 sd below both means: each Phi is ~1e-790, so the ratio is 0/0
+    # unless it is formed in log space.
+    deep = importance_weights(np.array([-60.0, 0.0, 3.0]), np.zeros(1), np.ones(1), np.full(1, 0.3), np.full(1, 0.8))
+    check("finite when both Phi underflow", bool(np.all(np.isfinite(deep))), f"weights {np.round(deep[0], 4)}")
+
+    # End-to-end: the weights only reweight, so `is` must stay a valid relevance,
+    # and for observations whose own future value sits far below f*_t they are
+    # ~1 and `is` should coincide with `full` drawn from the same randoms.
+    n, d = 30, 3
+    xx, tt, yy = dataset(n, d, seed=5)
+    kwargs = dict(t0=1.0, lam=LAM, lS=LS, lT=LT, noise_var=NOISE, n_times=6, n_max_samples=64, n_candidates=256)
+    full = mi_criterion(xx, tt, yy, fstar_source="full", rng=np.random.default_rng(0), **kwargs)
+    imp = mi_criterion(xx, tt, yy, fstar_source="is", rng=np.random.default_rng(0), **kwargs)
+    check("is: finite and non-negative", bool(np.all(np.isfinite(imp)) and np.all(imp >= 0.0)))
+    rel = np.abs(imp - full) / np.maximum(full, 1e-300)
+    check("is coincides with full for the stale half", float(rel[:n // 2].max()) < 1e-3,
+          f"max rel gap {rel[:n // 2].max():.2e} (all: {rel.max():.2e})")
+
+    perm = np.random.default_rng(7).permutation(n)
+    shuffled = mi_criterion(xx[perm], tt[perm], yy[perm], fstar_source="is", rng=np.random.default_rng(0), **kwargs)
+    err = np.abs(imp[perm] - shuffled).max()
+    check("is is permutation-equivariant", err < 1e-9, f"max abs error {err:.2e}")
+
+    try:
+        mi_criterion(xx, tt, yy, fstar_source="bogus", **kwargs)
+        check("unknown fstar_source is rejected", False)
+    except ValueError:
+        check("unknown fstar_source is rejected", True)
+
+
 def test_cost():
     """The criterion is called inside the cleaning loop, so it has a time budget.
 
@@ -353,10 +438,10 @@ def test_cost():
     land well under that, or the two arms are no longer comparable at a fixed
     wall-clock budget.
     """
-    print("\n8. Cost at realistic dataset sizes")
+    print("\n9. Cost at realistic dataset sizes")
     for n in (50, 150, 250):
         xx, tt, yy = dataset(n, 3, seed=n)
-        for source, budget in (("full", 0.15), ("loo", 12.0)):
+        for source, budget in (("full", 0.15), ("is", 0.25), ("loo", 12.0)):
             mark = time.time()
             mi_criterion(xx, tt, yy, t0=1.0, lam=LAM, lS=LS, lT=LT, noise_var=NOISE,
                          n_times=8, n_max_samples=32, n_candidates=512,
@@ -368,7 +453,7 @@ def test_cost():
     # The default costs one max-value solve per observation rather than one in
     # total, so it is the best part of n times dearer and the budget above is
     # loose. At a fixed wall-clock experiment budget that buys fewer queries,
-    # which is the trade --mi-fstar-full exists to undo; the timings are printed
+    # which is the trade --mi-fstar full/is exist to undo; the timings are printed
     # so that choice rests on measurements and not on the ratio being "about n".
 
 
@@ -380,7 +465,7 @@ def main():
     for test in (test_leave_one_out_moments, test_leave_one_out_candidate_moments,
                  test_permutation_invariance, test_truncated_variance,
                  test_conditional_variance_monte_carlo, test_gumbel_sampler, test_time_grid,
-                 test_relevance_behaviour, test_cost):
+                 test_relevance_behaviour, test_importance_weights, test_cost):
         test()
 
     print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
