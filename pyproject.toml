@@ -31,6 +31,7 @@ wdbo-plot = "wdbo_algo.plot_results:main"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
+temperature = ["pandas>=2.0", "scipy>=1.11"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -10,6 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "experiments"))
 import common
 from scoring import score_run
+from wdbo_algo.candidate_optimizer import CandidatePruningOptimizer
 
 
 class Clock:
@@ -113,3 +114,14 @@ def test_same_seed_log_roundtrip_and_rescore(tmp_path):
     rescored, _ = common.score_results(loaded, restored_metadata, objective, 0.01)
     assert [row["time_avg_regret"] for row in rescored] == pytest.approx(
         [row["time_avg_regret"] for row in per_seed])
+
+
+def test_dual_gate_uses_shared_dataset_floor():
+    objective = type("Objective", (), {"spatial_domain": np.array([[0.0, 1.0]])})()
+    optimizer = common.build_optimizer(
+        objective, n_initial_observations=5, alpha=0.25,
+        criterion="dual_gate", min_dataset_size=5,
+        mi_options={"candidate_pool_size": 16}, seed=0)
+    assert isinstance(optimizer, CandidatePruningOptimizer)
+    assert optimizer._min_dataset_size == 5
+    assert optimizer._candidate_pool_size == 16

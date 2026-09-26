@@ -57,6 +57,7 @@ import torch
 from wdbo_algo.mi_criterion import FSTAR_SOURCES
 from wdbo_algo.mi_optimizer import MIDBOOptimizer
 from wdbo_algo.optimizer import WDBOOptimizer
+from wdbo_algo.candidate_optimizer import CandidatePruningOptimizer
 from scoring import score_run
 
 # Paper H.1: the initial observations are sampled uniformly in S' x [0, 1/40]
@@ -73,7 +74,9 @@ REFERENCE_DURATION = 600.0
 
 # Which removal criterion an arm uses. "none" is the ablation: clean() is never
 # called, so the dataset grows monotonically.
-CRITERIA = ("wasserstein", "mi", "none")
+CANDIDATE_CRITERIA = ("nas", "hellinger", "js", "dual_gate",
+                      "dual_gate_budget", "joint_dual_gate")
+CRITERIA = ("wasserstein", "mi", "none", *CANDIDATE_CRITERIA)
 
 # Resolution of the common wall-clock grid for per-seed curves. The scorer
 # adds configuration changes and oracle-table knots for the integral itself.
@@ -112,6 +115,10 @@ def query_fields(spatial_dim: int) -> list[str]:
         "dataset_size", "n_removed",
         "lambda", "lS", "lT", "noise", "removal_budget",
         "min_criterion", "criterion_lT", "budget_spent",
+        "gate_rejected", "normalized_margin", "nas_min", "hellinger_min",
+        "js_min", "joint_load_min", "deletion_limit", "effective_dimension",
+        "dataset_reserve", "single_prune_credit", "single_prune_cost",
+        "gate_load_min", "budget_pressure", "budget_refill", "sequential_spend",
     ]
 
 
@@ -241,6 +248,11 @@ def build_optimizer(objective, n_initial_observations: int, alpha: float, criter
         return MIDBOOptimizer(objective.spatial_domain, *kernels, seed=seed,
                               **(mi_options or {}), **kwargs)
 
+    if criterion in CANDIDATE_CRITERIA:
+        return CandidatePruningOptimizer(
+            objective.spatial_domain, *kernels, pruning_method=criterion,
+            **(mi_options or {}), **kwargs)
+
     return WDBOOptimizer(objective.spatial_domain, *kernels, **kwargs)
 
 
@@ -251,7 +263,8 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
     """Run a single replication; return its raw per-query log and its run info.
 
     `criterion` selects the removal rule: "wasserstein" is W-DBO's own, "mi" is
-    the mutual-information criterion, and "none" is the ablation in which
+    the mutual-information criterion, candidate criteria include the individual
+    gates and full Dual Gate variants, and "none" is the ablation in which
     `clean()` is never called, so the dataset grows monotonically -- same model,
     same kernels, same acquisition, same clock, only removal disabled. Under
     "none", `n_removed` and `removal_budget` are trivially 0 and 1.0, and
@@ -335,6 +348,14 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
         "min_criterion": float("nan"),
         "criterion_lT": float("nan"),
         "budget_spent": 0.0,
+        "gate_rejected": 0,
+        "normalized_margin": float("nan"), "nas_min": float("nan"),
+        "hellinger_min": float("nan"), "js_min": float("nan"),
+        "joint_load_min": float("nan"), "deletion_limit": float("nan"),
+        "effective_dimension": float("nan"), "dataset_reserve": float("nan"),
+        "single_prune_credit": float("nan"), "single_prune_cost": float("nan"),
+        "gate_load_min": float("nan"), "budget_pressure": float("nan"),
+        "budget_refill": float("nan"), "sequential_spend": float("nan"),
     }]
 
     start = time.perf_counter()
@@ -386,6 +407,11 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
             optimizer.clean(env_start + env_speed * t_update_done)
         step_end = time.perf_counter()
         t_step_end = step_end - start
+        clean_diagnostics = getattr(optimizer, "last_clean_diagnostics", {})
+
+        def diagnostic(name):
+            value = clean_diagnostics.get(name, float("nan"))
+            return float(value) if value not in (None, "") else float("nan")
 
         # The MLE hyperparameters and removal budget as the next iteration will
         # see them. Read off private attributes: `wdbo_algo` is vendored in this
@@ -426,9 +452,16 @@ def run_once(objective, duration_seconds: float, n_initial_observations: int, al
             # This is the quantity `--mi-alpha` has to be calibrated against, and
             # `criterion_lT` is the lengthscale it was measured under -- not the
             # same as `lT` above, which is post-cleaning.
-            "min_criterion": optimizer._last_min_criterion,
-            "criterion_lT": optimizer._last_min_lT,
-            "budget_spent": optimizer._budget_spent,
+            "min_criterion": getattr(optimizer, "_last_min_criterion", float("nan")),
+            "criterion_lT": getattr(optimizer, "_last_min_lT", float("nan")),
+            "budget_spent": getattr(optimizer, "_budget_spent", float("nan")),
+            "gate_rejected": int(clean_diagnostics.get("stopped") == "no_candidate_passed_gate"),
+            **{name: diagnostic(name) for name in (
+                "normalized_margin", "nas_min", "hellinger_min", "js_min",
+                "joint_load_min", "deletion_limit", "effective_dimension",
+                "dataset_reserve", "single_prune_credit", "single_prune_cost",
+                "gate_load_min", "budget_pressure", "budget_refill", "sequential_spend",
+            )},
         })
 
         # An iteration that started inside the budget may finish outside it. We
@@ -479,6 +512,7 @@ def summarize_seed(run: list[dict], score: dict,
     # and on any query whose loop broke before scoring anything.
     min_criterion = np.array([row.get("min_criterion", np.nan) for row in run], dtype=float)
     median_min_criterion = float(np.nanmedian(min_criterion)) if np.any(np.isfinite(min_criterion)) else float("nan")
+    query_intervals = np.diff([row["t_apply"] for row in run])
 
     extra = {} if info is None else {
         "warmup_seconds": info["warmup_seconds"],
@@ -505,6 +539,10 @@ def summarize_seed(run: list[dict], score: dict,
         "avg_fit_time": _mean_of(run, "t_fit"),
         "avg_eval_time": _mean_of(run, "t_eval"),
         "avg_clean_time": _mean_of(run, "t_clean"),
+        "median_query_interval": (float(np.median(query_intervals))
+                                  if len(query_intervals) else float("nan")),
+        "p95_query_interval": (float(np.percentile(query_intervals, 95))
+                               if len(query_intervals) else float("nan")),
         "final_dataset_size": (run[-1] if run else initial)["dataset_size"],
         "max_dataset_size": max(row["dataset_size"] for row in [initial, *run]),
         "min_dataset_size": min(row["dataset_size"] for row in [initial, *run]),
@@ -521,6 +559,8 @@ HEADLINE_METRICS = [
     ("response_time_s", "avg_response_time"),
     ("acq_fit_time_s", "avg_acq_fit_time"),
     ("clean_time_s", "avg_clean_time"),
+    ("median_query_interval_s", "median_query_interval"),
+    ("p95_query_interval_s", "p95_query_interval"),
     ("iterations", "iterations"),
 ]
 
@@ -668,7 +708,7 @@ def load_run(out_dir: Path) -> tuple[list[list[dict]], dict]:
     """
     metadata = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
 
-    ints = {"seed", "iteration", "dataset_size", "n_removed"}
+    ints = {"seed", "iteration", "dataset_size", "n_removed", "gate_rejected"}
     runs: list[list[dict]] = []
     with open(out_dir / "queries.csv", newline="") as f:
         reader = csv.DictReader(f)
@@ -929,7 +969,7 @@ def add_criterion_arguments(parser):
     """
     parser.add_argument("--criterion", choices=CRITERIA, default="wasserstein",
                         help="Removal rule: W-DBO's Wasserstein criterion, the mutual-information "
-                             "criterion, or none (the ablation, equivalent to --no-removal).")
+                             "criterion, candidate/Dual Gate rules, or none (the no-removal ablation).")
     parser.add_argument("--alpha", type=float, default=0.25,
                         help="Removal-budget hyperparameter for --criterion wasserstein "
                              "(paper's Table 2 value: 1/4).")
@@ -968,6 +1008,22 @@ def add_criterion_arguments(parser):
     parser.add_argument("--mi-clip-horizon", action="store_true",
                         help="Cap the criterion's future horizon at the environment time the run ends at, "
                              "instead of letting it run as far as the model's own lengthscale reaches.")
+    parser.add_argument("--candidate-pool-size", type=int, default=128,
+                        help="Spatial candidates used to evaluate candidate-based removal rules.")
+    parser.add_argument("--contender-kappa", type=float, default=1.0,
+                        help="UCB contender threshold used by candidate-based rules.")
+    parser.add_argument("--hellinger-threshold", type=float, default=0.1,
+                        help="Dual Gate/Hellinger acceptance threshold.")
+    parser.add_argument("--js-temperature", type=float, default=1.0,
+                        help="Softmax temperature for the JS choice-distance rule.")
+    parser.add_argument("--max-deletions-per-clean", type=int, default=2,
+                        help="Maximum removals per cleaning call for candidate rules.")
+    parser.add_argument("--max-deletion-fraction", type=float, default=0.25,
+                        help="Burst cap for joint Dual Gate.")
+    parser.add_argument("--single-budget-base-cost", type=float, default=0.1)
+    parser.add_argument("--single-budget-min-reserve", type=int, default=10)
+    parser.add_argument("--single-budget-effective-dim-multiplier", type=float, default=1.25)
+    parser.add_argument("--single-budget-credit-cap", type=float, default=1.0)
     parser.add_argument("--no-removal", action="store_true",
                         help="Alias for --criterion none. Compare against a removal arm at the same "
                              "--duration-seconds, never at the same iteration count.")
@@ -989,6 +1045,23 @@ def criterion_settings(args, env_end: float) -> tuple[str, float, dict, str]:
         description that goes into the figure title and run.json.
     """
     criterion = "none" if args.no_removal else args.criterion
+
+    if criterion in CANDIDATE_CRITERIA:
+        options = dict(
+            candidate_pool_size=args.candidate_pool_size,
+            contender_kappa=args.contender_kappa,
+            hellinger_threshold=args.hellinger_threshold,
+            js_temperature=args.js_temperature,
+            max_deletions_per_clean=(None if criterion == "joint_dual_gate"
+                                     else args.max_deletions_per_clean),
+            max_deletion_fraction=args.max_deletion_fraction,
+            single_budget_base_cost=args.single_budget_base_cost,
+            single_budget_min_reserve=max(args.single_budget_min_reserve,
+                                          args.min_dataset_size),
+            single_budget_effective_dim_multiplier=args.single_budget_effective_dim_multiplier,
+            single_budget_credit_cap=args.single_budget_credit_cap,
+        )
+        return criterion, args.alpha, options, f"{criterion}, alpha={args.alpha:g}"
 
     if criterion != "mi":
         variant = "no removal" if criterion == "none" else f"wasserstein, alpha={args.alpha:g}"

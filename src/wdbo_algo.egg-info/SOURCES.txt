@@ -4,6 +4,10 @@ pyproject.toml
 src/test.py
 src/wdbo_algo/__init__.py
 src/wdbo_algo/benchmarks.py
+src/wdbo_algo/candidate_model.py
+src/wdbo_algo/candidate_optimizer.py
+src/wdbo_algo/mi_criterion.py
+src/wdbo_algo/mi_optimizer.py
 src/wdbo_algo/model.py
 src/wdbo_algo/optimizer.py
 src/wdbo_algo/plot_results.py
@@ -15,4 +19,7 @@ src/wdbo_algo.egg-info/entry_points.txt
 src/wdbo_algo.egg-info/requires.txt
 src/wdbo_algo.egg-info/top_level.txt
 tests/test_benchmarks.py
+tests/test_candidate_distances.py
+tests/test_experiment_pipeline.py
 tests/test_plot_results.py
+tests/test_scoring.py

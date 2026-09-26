@@ -6,3 +6,7 @@ matplotlib>=3.8
 
 [dev]
 pytest>=8
+
+[temperature]
+pandas>=2.0
+scipy>=1.11

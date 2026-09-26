@@ -41,14 +41,19 @@ iteration count would hide exactly the cost being studied — see the warning in
 
 ### The arms
 
-All three are the same optimizer, the same kernels, the same acquisition
-function and the same clock. Only the removal rule differs.
+All arms use the same kernels, acquisition function, clock, logger, and scorer.
+Candidate/Dual Gate arms use `CandidatePruningOptimizer` because they need
+extra posterior diagnostics; its shared GP and dataset floor are configured
+identically to the other arms. Only the removal rule differs.
 
 | `--criterion` | Rule | Notes |
 |---|---|---|
 | `wasserstein` | W-DBO's own criterion | The paper's method. `--alpha 0.25` is its Table 2 setting. |
 | `mi` | Mutual information with the future maximum | Our alternative. Unnormalized (nats), so `--mi-alpha` is **not** comparable to `--alpha`; see [`MI_CRITERION.md`](MI_CRITERION.md). |
 | `none` | Never call `clean()` | The ablation the paper lacks. The dataset grows monotonically. |
+| `nas`, `hellinger`, `js` | Individual candidate-selection gates | Diagnostic ablations for the components used by Dual Gate. |
+| `dual_gate` | NAS and Hellinger gates | A point is removable only when both gates accept it. |
+| `dual_gate_budget`, `joint_dual_gate` | Budgeted Dual Gate variants | Log rejection and budget diagnostics for each cleaning call. |
 
 The `none` arm is what makes the paper's claim falsifiable. The paper compares
 W-DBO against other *algorithms*; it never compares W-DBO against **itself
@@ -439,11 +444,15 @@ with its default.
 
 ## 9. Known gaps
 
-Tracked against the benchmark note's priorities:
+Tracked against the full teacher note:
 
+- **Criterion-only comparison is incomplete:** fixed simulated query scheduling,
+  `max_dataset_size`, and oldest/random removal controls are not implemented.
 - **Ackley does not move its optimum**, so neither benchmark currently tests
   optimum-tracking, dwelling in a persistently suboptimal region, or abrupt
   regime change.
 - **Numerical validation:** the analytic scorer tests and short WSL GP smoke
   runs pass. A full 600-second, multi-seed experiment and oracle-resolution
   sensitivity study are still needed before reporting method comparisons.
+- **Final protocol is pending:** use at least 10 paired seeds, separate tuning
+  and test seeds, keep CPU/thread settings fixed, and run methods sequentially.
